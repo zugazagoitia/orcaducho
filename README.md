@@ -46,6 +46,12 @@ Then, in Claude Code inside an Orca terminal: `/orcaducho:orcaducho <objective>`
 
 The repository must be added to Orca, and you run orcaducho from a terminal **inside Orca**.
 
+**Platforms and shells:** macOS and Linux, with a login shell of sh, bash, zsh or fish.
+- Nothing in orcaducho depends on your shell. Agents are started through a generated POSIX `sh` launcher, so Orca's terminal only ever runs `sh "<path>"`.
+- `install.sh` is plain POSIX sh, so it works under dash too.
+- The CLI uses only the Python standard library (3.9+).
+- Your `check` command always runs with `/bin/sh`.
+
 ## Install
 
 **One line:**
@@ -71,7 +77,10 @@ curl -fsSL https://raw.githubusercontent.com/zugazagoitia/orcaducho/main/install
    python3 ~/.claude/plugins/marketplaces/orcaducho/bin/orcaducho install
    ```
 
-   Make sure `~/.local/bin` is on your `PATH`.
+   Make sure `~/.local/bin` is on your `PATH`:
+   - fish: `fish_add_path ~/.local/bin`
+   - zsh: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`
+   - bash: add the same line to `~/.bashrc` on Linux, or `~/.bash_profile` on macOS
 
 3. Restart Claude Code, then check that everything is visible:
    - `orcaducho --help` works in a shell.
@@ -243,7 +252,7 @@ rm ~/.local/bin/orcaducho
 ```sh
 git clone https://github.com/zugazagoitia/orcaducho && cd orcaducho
 claude plugin validate .
-export ORCADUCHO_PLUGIN_DIR="$PWD"     # sessions orcaducho starts load this checkout
+export ORCADUCHO_PLUGIN_DIR="$PWD"     # bash/zsh; fish: set -gx ORCADUCHO_PLUGIN_DIR $PWD
 claude --plugin-dir "$PWD" --agent orcaducho:coordinator
 ```
 

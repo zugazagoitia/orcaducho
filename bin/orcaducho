@@ -111,16 +111,32 @@ def plugin_dir_args() -> list[str]:
     return ["--plugin-dir", d] if d else []
 
 
-def claude_cmd(role: str, model: str, effort: str | None, name: str, env: dict[str, str], cfg: dict, prompt: str | None = None) -> str:
+def claude_argv(role: str, model: str, effort: str | None, name: str, env: dict[str, str], cfg: dict, prompt: str | None = None) -> list[str]:
+    """`env K=V … claude …` as an argv list (no shell involved)."""
     env = {**env, "ORCADUCHO_MODEL": model, "ORCADUCHO_PLUGIN_DIR": os.environ.get("ORCADUCHO_PLUGIN_DIR", "")}
-    parts = ["env", *(f"{k}={v}" for k, v in env.items() if v)]
-    parts += ["claude", *plugin_dir_args(), "--agent", f"{PLUGIN}:{role}", "--model", model, "-n", name]
+    argv = ["env", *(f"{k}={v}" for k, v in env.items() if v)]
+    argv += ["claude", *plugin_dir_args(), "--agent", f"{PLUGIN}:{role}", "--model", model, "-n", name]
     if effort:
-        parts += ["--effort", effort]
-    parts += list(cfg.get("claudeArgs") or [])
+        argv += ["--effort", effort]
+    argv += list(cfg.get("claudeArgs") or [])
     if prompt:
-        parts.append(prompt)
-    return shlex.join(parts)
+        argv.append(prompt)
+    return argv
+
+
+def launcher(argv: list[str], key: str) -> str:
+    """Write a POSIX sh launcher and return a command any login shell (sh, bash, zsh, fish) runs identically.
+
+    Orca runs `terminal create --command` in the user's shell, and fish does not parse POSIX quoting,
+    so the only thing the user's shell sees is `sh "<absolute path>"`.
+    """
+    d = Path(git("rev-parse", "--absolute-git-dir")) / PLUGIN
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"launch-{slug(key)}.sh"
+    f.write_text(f"#!/bin/sh\nexec {shlex.join(argv)}\n")
+    if any(c in str(f) for c in '"$`\\'):
+        die(f"unsupported character in launcher path: {f}")
+    return f'sh "{f}"'
 
 
 # ---------------------------------------------------------------- start
@@ -135,7 +151,8 @@ def cmd_start(a: argparse.Namespace) -> None:
             die("run inside an Orca terminal, or pass --name to create a new worktree for the run")
         name = label("coordinator", objective or "session")
         orca("terminal", "rename", "--terminal", os.environ["ORCA_TERMINAL_HANDLE"], "--title", name, check=False)
-        os.execvp("sh", ["sh", "-c", claude_cmd("coordinator", a.model, a.effort, name, env, cfg, objective or None)])
+        argv = claude_argv("coordinator", a.model, a.effort, name, env, cfg, objective or None)
+        os.execvp(argv[0], argv)
 
     base = a.base or cfg.get("base") or ""
     wt_args = ["worktree", "create", "--name", a.name, "--no-parent", "--setup", "run"]
@@ -148,7 +165,8 @@ def cmd_start(a: argparse.Namespace) -> None:
     name = label("coordinator", objective or a.name)
     orca("worktree", "set", "--worktree", f"id:{wt_id}", "--display-name", name, check=False)
     term = orca("terminal", "create", "--worktree", f"id:{wt_id}", "--title", name,
-                "--command", claude_cmd("coordinator", a.model, a.effort, name, env, cfg, objective or None))
+                "--command", launcher(claude_argv("coordinator", a.model, a.effort, name, env, cfg, objective or None),
+                                      f"coordinator-{a.name}"))
     handle = find(term, lambda k, v: k == "handle" and isinstance(v, str))
     print(json.dumps({"worktree": wt_id, "handle": handle, "name": name}))
 
@@ -190,7 +208,7 @@ def cmd_spawn(a: argparse.Namespace) -> None:
     }
     model = a.model or DEFAULT_MODEL[a.role]
     term = orca("terminal", "create", "--worktree", selector, "--title", name,
-                "--command", claude_cmd(a.role, model, a.effort, name, env, cfg))
+                "--command", launcher(claude_argv(a.role, model, a.effort, name, env, cfg), f"{a.role}-{a.task}-{model}"))
     handle = find(term, lambda k, v: k == "handle" and isinstance(v, str) and v.startswith("term_"))
     if not handle:
         die(f"could not read the terminal handle: {json.dumps(term)[:400]}")
