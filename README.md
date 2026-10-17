@@ -247,6 +247,8 @@ export ORCADUCHO_PLUGIN_DIR="$PWD"     # sessions orcaducho starts load this che
 claude --plugin-dir "$PWD" --agent orcaducho:coordinator
 ```
 
+**Releasing:** bump `version` in `.claude-plugin/plugin.json` with every change. Claude Code only refreshes an installed plugin when the version changes.
+
 ## License
 
 MIT
