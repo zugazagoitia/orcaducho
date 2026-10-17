@@ -1,0 +1,17 @@
+{
+  "name": "orcaducho",
+  "owner": {
+    "name": "Alberto Zugazagoitia",
+    "email": "arz329@gmail.com"
+  },
+  "metadata": {
+    "description": "orcaducho: token-frugal multi-agent harness for Claude Code on Orca"
+  },
+  "plugins": [
+    {
+      "name": "orcaducho",
+      "source": "./",
+      "description": "Token-frugal multi-agent harness on Orca (Opus plans, Sonnet leads, Haiku-first workers)."
+    }
+  ]
+}

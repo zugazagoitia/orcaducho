@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""orcaducho: launcher, spawner, GitHub-issue sync and hooks for the orcaducho harness.
+
+Every mechanical step lives here so agents spend tokens only on decisions.
+Stdlib only; works on macOS and Linux.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PLUGIN = "orcaducho"
+ROLES = ("coordinator", "lead", "worker")
+DEFAULT_MODEL = {"coordinator": "opus", "lead": "sonnet", "worker": "haiku"}
+REVIEW_MODEL = {"med": "haiku", "high": "sonnet"}
+MAX_GATE_FAILURES = 2  # first failure: worker fixes; second: report failed so the coordinator escalates
+DIFF_LIMIT = 60_000
+
+
+# ---------------------------------------------------------------- helpers
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"orcaducho: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def orca_exe() -> str:
+    """Resolve the Orca CLI exactly as the orca-cli skill prescribes."""
+    if os.environ.get("ORCA_CLI_COMMAND"):
+        return os.environ["ORCA_CLI_COMMAND"]
+    if os.environ.get("ORCA_DEV_REPO_ROOT"):
+        return "orca-dev"
+    if sys.platform.startswith("linux") and not os.environ.get("ORCA_TERMINAL_HANDLE"):
+        return "orca-ide"  # bare `orca` is the GNOME screen reader outside Orca terminals
+    return "orca"
+
+
+def run(cmd: list[str], cwd: str | None = None, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess:
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if check and p.returncode != 0:
+        die(f"{shlex.join(cmd)} failed ({p.returncode}): {(p.stderr or p.stdout).strip()[-800:]}")
+    return p
+
+
+def orca(*args: str, check: bool = True) -> dict:
+    p = run([orca_exe(), *args, "--json"], check=False)
+    try:
+        data = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        data = {"ok": False, "raw": (p.stdout + p.stderr).strip()[-800:]}
+    if check and (p.returncode != 0 or not data.get("ok", False)):
+        die(f"orca {' '.join(args[:2])} failed: {json.dumps(data.get('error') or data)[:800]}")
+    return data
+
+
+def find(obj, pred):
+    """Depth-first search for the first (key, value) pair matching pred."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if pred(k, v):
+                return v
+            r = find(v, pred)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = find(v, pred)
+            if r is not None:
+                return r
+    return None
+
+
+def git(*args: str, cwd: str | None = None, check: bool = True) -> str:
+    return run(["git", *args], cwd=cwd, check=check).stdout.strip()
+
+
+def toplevel(cwd: str | None = None) -> Path:
+    return Path(git("rev-parse", "--show-toplevel", cwd=cwd, check=False) or cwd or os.getcwd()).resolve()
+
+
+def config(cwd: str | None = None) -> dict:
+    cfg = {"check": "", "base": "", "issues": True, "claudeArgs": ["--permission-mode", "acceptEdits"]}
+    try:
+        f = toplevel(cwd) / ".orcaducho.json"
+        if f.exists():
+            cfg.update(json.loads(f.read_text()))
+    except SystemExit:
+        pass
+    return cfg
+
+
+def label(role: str, title: str) -> str:
+    text = f"{PLUGIN}:{role} · {title}"
+    return text if len(text) <= 60 else text[:59] + "…"
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "task"
+
+
+def claude_cmd(role: str, model: str, effort: str | None, name: str, env: dict[str, str], cfg: dict, prompt: str | None = None) -> str:
+    parts = ["env", *(f"{k}={v}" for k, v in env.items() if v)]
+    parts += ["claude", "--agent", f"{PLUGIN}:{role}", "--model", model, "-n", name]
+    if effort:
+        parts += ["--effort", effort]
+    parts += list(cfg.get("claudeArgs") or [])
+    if prompt:
+        parts.append(prompt)
+    return shlex.join(parts)
+
+
+# ---------------------------------------------------------------- start
+
+def cmd_start(a: argparse.Namespace) -> None:
+    """Launch the Opus coordinator, named, inside an Orca terminal."""
+    objective = " ".join(a.objective).strip()
+    cfg = config()
+    env = {"ORCADUCHO_ROLE": "coordinator"}
+    if not a.name:
+        if not os.environ.get("ORCA_TERMINAL_HANDLE"):
+            die("run inside an Orca terminal, or pass --name to create a new worktree for the run")
+        name = label("coordinator", objective or "session")
+        orca("terminal", "rename", "--terminal", os.environ["ORCA_TERMINAL_HANDLE"], "--title", name, check=False)
+        os.execvp("sh", ["sh", "-c", claude_cmd("coordinator", a.model, a.effort, name, env, cfg, objective or None)])
+
+    base = a.base or cfg.get("base") or ""
+    wt_args = ["worktree", "create", "--name", a.name, "--no-parent", "--setup", "run"]
+    if base:
+        wt_args += ["--base-branch", base]
+    wt = orca(*wt_args)
+    wt_id = find(wt, lambda k, v: k == "id" and isinstance(v, str) and "::" in v)
+    if not wt_id:
+        die(f"could not read the new worktree id: {json.dumps(wt)[:400]}")
+    name = label("coordinator", objective or a.name)
+    orca("worktree", "set", "--worktree", f"id:{wt_id}", "--display-name", name, check=False)
+    term = orca("terminal", "create", "--worktree", f"id:{wt_id}", "--title", name,
+                "--command", claude_cmd("coordinator", a.model, a.effort, name, env, cfg, objective or None))
+    handle = find(term, lambda k, v: k == "handle" and isinstance(v, str))
+    print(json.dumps({"worktree": wt_id, "handle": handle, "name": name}))
+
+
+# ---------------------------------------------------------------- spawn
+
+def cmd_spawn(a: argparse.Namespace) -> None:
+    """Start one named, supervised lead/worker for an existing Orca Task."""
+    cfg = config()
+    cur = os.environ.get("ORCA_WORKTREE_ID")
+    base_sha = git("rev-parse", "HEAD")
+
+    branch = None
+    if a.worktree == "new-child":
+        branch = a.branch or f"{PLUGIN}/{slug(a.title)}-{a.task[-6:]}"
+        wt = orca("worktree", "create", "--name", branch,
+                  "--parent-worktree", f"id:{cur}" if cur else "current",
+                  "--base-branch", git("rev-parse", "--abbrev-ref", "HEAD"),
+                  "--setup", "run")
+        wt_id = find(wt, lambda k, v: k == "id" and isinstance(v, str) and "::" in v)
+        if not wt_id:
+            die(f"could not read the new worktree id: {json.dumps(wt)[:400]}")
+        selector = f"id:{wt_id}"
+        orca("worktree", "set", "--worktree", selector, "--display-name", label(a.role, a.title), check=False)
+    elif a.worktree == "current":
+        selector = f"id:{cur}" if cur else "current"
+    else:
+        selector = a.worktree
+
+    name = label(a.role, a.title)
+    env = {
+        "ORCADUCHO_ROLE": a.role,
+        "ORCADUCHO_TASK": a.task,
+        "ORCADUCHO_RISK": a.risk,
+        "ORCADUCHO_ISSUE": a.issue or "",
+        "ORCADUCHO_OWNS": a.owns or "",
+        "ORCADUCHO_BASE": base_sha,
+    }
+    model = a.model or DEFAULT_MODEL[a.role]
+    term = orca("terminal", "create", "--worktree", selector, "--title", name,
+                "--command", claude_cmd(a.role, model, a.effort, name, env, cfg))
+    handle = find(term, lambda k, v: k == "handle" and isinstance(v, str) and v.startswith("term_"))
+    if not handle:
+        die(f"could not read the terminal handle: {json.dumps(term)[:400]}")
+    orca("terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "120000", check=False)
+
+    ws = ["orchestration", "worker-start", "--task", a.task, "--terminal", handle, "--worktree", selector]
+    if a.retry_of:
+        ws += ["--retry-of", a.retry_of]
+    if a.run:
+        ws += ["--run", a.run]
+    res = orca(*ws)
+    dispatch = find(res, lambda k, v: k in ("dispatchId", "dispatch_id") and isinstance(v, str))
+    print(json.dumps({"task": a.task, "dispatch": dispatch, "handle": handle, "worktree": selector, "branch": branch,
+                      "agent": f"{PLUGIN}:{a.role}", "model": model, "name": name}))
+
+
+# ---------------------------------------------------------------- merge
+
+def cmd_merge(a: argparse.Namespace) -> None:
+    """Merge a finished child branch into the current branch; abort cleanly on conflict."""
+    p = run(["git", "merge", "--no-ff", "--no-edit", a.branch], check=False)
+    if p.returncode == 0:
+        print(json.dumps({"merged": a.branch, "head": git("rev-parse", "--short", "HEAD")}))
+        return
+    conflicts = git("diff", "--name-only", "--diff-filter=U", check=False).splitlines()
+    run(["git", "merge", "--abort"], check=False)
+    print(json.dumps({"merged": False, "branch": a.branch, "conflicts": conflicts}))
+    sys.exit(2)
+
+
+# ---------------------------------------------------------------- issues
+
+def issues_enabled() -> bool:
+    if not config().get("issues", True) or not shutil.which("gh"):
+        return False
+    return run(["gh", "repo", "view", "--json", "hasIssuesEnabled", "-q", ".hasIssuesEnabled"], check=False).stdout.strip() == "true"
+
+
+def ensure_labels() -> None:
+    for name, color in (("orcaducho", "5319e7"), ("risk:low", "0e8a16"), ("risk:med", "fbca04"),
+                        ("risk:high", "b60205"), ("status:failed", "d93f0b")):
+        run(["gh", "label", "create", name, "--color", color, "--force"], check=False)
+
+
+def cmd_issue(a: argparse.Namespace) -> None:
+    if not issues_enabled():
+        print("-")  # issues off: callers treat "-" as "no issue"
+        return
+    ensure_labels()
+    labels = ["--label", "orcaducho"]
+    if a.kind == "task":
+        labels += ["--label", f"risk:{a.risk}"]
+    url = run(["gh", "issue", "create", "--title", a.title, "--body", a.body or "", *labels]).stdout.strip()
+    number = url.rstrip("/").rsplit("/", 1)[-1]
+    if a.kind == "task" and a.parent and a.parent != "-":
+        repo = run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]).stdout.strip()
+        sub_id = run(["gh", "api", f"repos/{repo}/issues/{number}", "-q", ".id"]).stdout.strip()
+        run(["gh", "api", "-X", "POST", f"repos/{repo}/issues/{a.parent}/sub_issues",
+             "-F", f"sub_issue_id={sub_id}"], check=False)
+    print(number)
+
+
+# ---------------------------------------------------------------- hooks
+
+GLOB_CACHE: dict[str, re.Pattern] = {}
+
+
+def glob_re(pattern: str) -> re.Pattern:
+    if pattern not in GLOB_CACHE:
+        out, i = "", 0
+        while i < len(pattern):
+            c = pattern[i]
+            if pattern.startswith("**/", i):
+                out, i = out + "(?:.*/)?", i + 3
+            elif pattern.startswith("**", i):
+                out, i = out + ".*", i + 2
+            elif c == "*":
+                out, i = out + "[^/]*", i + 1
+            elif c == "?":
+                out, i = out + "[^/]", i + 1
+            else:
+                out, i = out + re.escape(c), i + 1
+        GLOB_CACHE[pattern] = re.compile(out + r"\Z")
+    return GLOB_CACHE[pattern]
+
+
+def deny(reason: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                             "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
+    sys.exit(0)
+
+
+def is_worker_done(command: str) -> bool:
+    return "orchestration send" in command and "worker_done" in command
+
+
+def hook_guard(event: dict) -> None:
+    """Coordinator never edits files; workers only edit what they own."""
+    role = os.environ.get("ORCADUCHO_ROLE")
+    path = (event.get("tool_input") or {}).get("file_path") or (event.get("tool_input") or {}).get("notebook_path")
+    if not path:
+        return
+    cwd = event.get("cwd") or os.getcwd()
+    try:
+        rel = Path(path).resolve().relative_to(toplevel(cwd)).as_posix()
+    except (ValueError, SystemExit):
+        rel = path
+    if role == "coordinator":
+        if rel.startswith(".orcaducho/") or rel == ".orcaducho.json":
+            return
+        deny("orcaducho coordinator plans only: dispatch a worker for file changes (only .orcaducho/ and .orcaducho.json are writable).")
+    owns = [g.strip() for g in os.environ.get("ORCADUCHO_OWNS", "").split(",") if g.strip()]
+    if owns and not any(glob_re(g).match(rel) for g in owns):
+        deny(f"{rel} is outside this task's ownership ({', '.join(owns)}). Use `orca orchestration ask` if you need it.")
+
+
+def gate_failures(add: bool = False) -> int:
+    f = Path(git("rev-parse", "--git-dir")) / f"orcaducho-gate-{os.environ.get('ORCADUCHO_TASK', 'x')}"
+    n = int(f.read_text()) if f.exists() else 0
+    if add:
+        n += 1
+        f.write_text(str(n))
+    return n
+
+
+def gate_fail(reason: str) -> None:
+    n = gate_failures(add=True)
+    if n >= MAX_GATE_FAILURES:
+        reason += ("\nGate failed twice: do not fix again. Send worker_done with --outcome failed and a "
+                   "three-sentence summary of what still fails, so the coordinator can escalate.")
+    else:
+        reason += "\nFix this once, commit, and send worker_done again."
+    deny(reason)
+
+
+def hook_gate(event: dict) -> None:
+    """Before a successful worker_done: clean tree, project checks, risk-tiered review."""
+    role = os.environ.get("ORCADUCHO_ROLE")
+    command = (event.get("tool_input") or {}).get("command", "")
+    if role not in ("worker", "lead") or not is_worker_done(command) or "--outcome succeeded" not in command:
+        return
+    if gate_failures() >= MAX_GATE_FAILURES:
+        deny("Gate already failed twice for this task: send worker_done with --outcome failed.")
+    cwd = event.get("cwd") or os.getcwd()
+    if git("status", "--porcelain", cwd=cwd):
+        deny("Commit all changes (git add -A && git commit) before worker_done.")
+
+    check = config(cwd).get("check")
+    if check:
+        try:
+            p = subprocess.run(check, shell=True, cwd=cwd, capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            gate_fail(f"Checks timed out: {check}")
+        if p.returncode != 0:
+            tail = "\n".join((p.stdout + p.stderr).strip().splitlines()[-30:])
+            gate_fail(f"Checks failed: {check}\n{tail}")
+
+    risk = os.environ.get("ORCADUCHO_RISK", "low")
+    if role != "worker" or risk not in REVIEW_MODEL:
+        return
+    base = os.environ.get("ORCADUCHO_BASE") or "HEAD~1"
+    diff = git("diff", f"{base}...HEAD", cwd=cwd)[:DIFF_LIMIT]  # three dots: only this branch's changes
+    if not diff:
+        return
+    spec = os.environ.get("ORCADUCHO_TASK", "")
+    prompt = (f"Review this diff for Orca task {spec} (risk: {risk}). Answer per your instructions.\n\n"
+              f"```diff\n{diff}\n```")
+    env = {**os.environ, "ORCADUCHO_ROLE": "reviewer"}
+    try:
+        p = subprocess.run(["claude", "-p", "--agent", f"{PLUGIN}:reviewer", "--model", REVIEW_MODEL[risk], prompt],
+                           cwd=cwd, capture_output=True, text=True, timeout=600, env=env)
+    except subprocess.TimeoutExpired:
+        return  # a stuck reviewer must not block delivery; checks already passed
+    verdict = p.stdout.strip()
+    if verdict.upper().startswith("FAIL"):
+        gate_fail(f"{REVIEW_MODEL[risk]} review failed:\n{verdict[:1500]}")
+
+
+def hook_post(event: dict) -> None:
+    """After worker_done: mirror the summary onto the task's GitHub issue (no model tokens)."""
+    issue = os.environ.get("ORCADUCHO_ISSUE")
+    command = (event.get("tool_input") or {}).get("command", "")
+    if not issue or issue == "-" or not is_worker_done(command) or not shutil.which("gh"):
+        return
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return
+    opts = {argv[i]: argv[i + 1] for i in range(len(argv) - 1) if argv[i].startswith("--")}
+    outcome = opts.get("--outcome", "unknown")
+    body = f"**{os.environ.get('ORCADUCHO_ROLE')} · {outcome}** — {opts.get('--subject', '')}\n\n{opts.get('--body', '')}"
+    subprocess.Popen(["gh", "issue", "comment", issue, "--body", body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if outcome == "failed":
+        subprocess.Popen(["gh", "issue", "edit", issue, "--add-label", "status:failed"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_hook(a: argparse.Namespace) -> None:
+    if os.environ.get("ORCADUCHO_ROLE") not in ROLES:
+        return  # inert outside orcaducho sessions
+    try:
+        event = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return
+    {"guard": hook_guard, "gate": hook_gate, "post": hook_post}[a.which](event)
+
+
+# ---------------------------------------------------------------- install
+
+def cmd_install(a: argparse.Namespace) -> None:
+    target = Path(a.dir).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    link = target / PLUGIN
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(Path(__file__).resolve())
+    print(f"{link} -> {Path(__file__).resolve()}")
+
+
+# ---------------------------------------------------------------- main
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog=PLUGIN, description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start", help="launch the Opus coordinator")
+    s.add_argument("objective", nargs="*")
+    s.add_argument("--name", help="create a new top-level worktree/branch with this name for the run")
+    s.add_argument("--base", help="base branch for --name (default: config base, else repo default)")
+    s.add_argument("--model", default=DEFAULT_MODEL["coordinator"])
+    s.add_argument("--effort", default=None)
+    s.set_defaults(fn=cmd_start)
+
+    s = sub.add_parser("spawn", help="start a named, supervised lead/worker for an Orca Task")
+    s.add_argument("--role", choices=("lead", "worker"), required=True)
+    s.add_argument("--task", required=True)
+    s.add_argument("--title", required=True)
+    s.add_argument("--model")
+    s.add_argument("--effort")
+    s.add_argument("--risk", choices=("low", "med", "high"), default="low")
+    s.add_argument("--issue")
+    s.add_argument("--owns", help="comma-separated globs relative to the repo root")
+    s.add_argument("--worktree", default="new-child", help="new-child (default), current, or an Orca selector")
+    s.add_argument("--branch")
+    s.add_argument("--retry-of")
+    s.add_argument("--run")
+    s.set_defaults(fn=cmd_spawn)
+
+    s = sub.add_parser("merge", help="merge a child branch into the current branch")
+    s.add_argument("branch")
+    s.set_defaults(fn=cmd_merge)
+
+    s = sub.add_parser("issue", help="create an epic or task issue (prints its number, or '-')")
+    s.add_argument("kind", choices=("epic", "task"))
+    s.add_argument("--title", required=True)
+    s.add_argument("--body")
+    s.add_argument("--parent")
+    s.add_argument("--risk", choices=("low", "med", "high"), default="low")
+    s.set_defaults(fn=cmd_issue)
+
+    s = sub.add_parser("hook", help="Claude Code hook entry point")
+    s.add_argument("which", choices=("guard", "gate", "post"))
+    s.set_defaults(fn=cmd_hook)
+
+    s = sub.add_parser("install", help="symlink this CLI onto PATH")
+    s.add_argument("--dir", default="~/.local/bin")
+    s.set_defaults(fn=cmd_install)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

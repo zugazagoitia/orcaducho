@@ -1,0 +1,12 @@
+{
+  "name": "orcaducho",
+  "version": "0.1.0",
+  "description": "Token-frugal multi-agent harness on Orca: an Opus coordinator plans, Sonnet leads split epics, Haiku-first workers implement, with deterministic gates and GitHub-issue state.",
+  "author": {
+    "name": "Alberto Zugazagoitia",
+    "email": "arz329@gmail.com"
+  },
+  "repository": "https://github.com/zugazagoitia/orcaducho",
+  "license": "MIT",
+  "keywords": ["orca", "orchestration", "multi-agent", "subagents", "worktrees"]
+}
