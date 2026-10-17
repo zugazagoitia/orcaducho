@@ -12,6 +12,15 @@ You
        └─ orcaducho:worker (Haiku → Sonnet)
 ```
 
+## Quick start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zugazagoitia/orcaducho/main/install.sh | sh   # once per machine
+orcaducho init --check "pnpm typecheck && pnpm test"                                        # once per repo
+```
+
+Then, in Claude Code inside an Orca terminal: `/orcaducho:orcaducho <objective>`.
+
 ## Contents
 
 - [Requirements](#requirements)
@@ -39,6 +48,16 @@ The repository must be added to Orca, and you run orcaducho from a terminal **in
 
 ## Install
 
+**One line:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zugazagoitia/orcaducho/main/install.sh | sh
+```
+
+[`install.sh`](install.sh) checks the requirements, adds the marketplace, installs the plugin and puts the `orcaducho` CLI in `~/.local/bin` (override with `ORCADUCHO_BIN_DIR`). It is safe to run again; append `-s -- --update` after `sh` to also pull the latest version.
+
+**Manually:**
+
 1. In Claude Code, add the marketplace and install the plugin:
 
    ```
@@ -60,7 +79,13 @@ The repository must be added to Orca, and you run orcaducho from a terminal **in
 
 ## Set up a project
 
-In the root of each repository you want to use orcaducho in, create `.orcaducho.json`. If it is missing, the coordinator writes a first version on its own.
+In each repository, run:
+
+```sh
+orcaducho init --check "pnpm typecheck && pnpm lint && pnpm test" [--base develop] [--skip-permissions] [--no-issues]
+```
+
+This writes `.orcaducho.json` and adds `.orcaducho/` to the repo's local git exclude list. `--base` defaults to origin's default branch. You can also write the file by hand; if it is missing, the coordinator writes a first version on its own.
 
 ```json
 {
@@ -78,7 +103,7 @@ In the root of each repository you want to use orcaducho in, create `.orcaducho.
   - Set `"claudeArgs": ["--dangerously-skip-permissions"]`, only if that is already how you run Claude in Orca.
 - **Issues:** with `gh` logged in and Issues enabled on the repo, orcaducho creates the labels `orcaducho`, `risk:low|med|high` and `status:failed` automatically. Set `"issues": false` to skip GitHub entirely.
 
-Add `.orcaducho/` (the coordinator's resumable plan) to your `.gitignore`.
+`.orcaducho/` holds the coordinator's resumable plan. `orcaducho init` already keeps it out of git; if you skipped `init`, add it to `.gitignore`.
 
 ## Usage
 
@@ -162,6 +187,7 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 | `orcaducho release --dispatch <id>` | `worker-release`, then close the agent's terminal |
 | `orcaducho merge <branch>` | `git merge --no-ff`. Exits 2 and lists the conflicting files if it conflicts (the merge is aborted) |
 | `orcaducho issue epic\|task --title "<t>" [--body "<b>"] [--parent <n>] [--risk <r>]` | Create an issue or sub-issue; prints its number, or `-` if issues are off |
+| `orcaducho init [--check "<cmd>"] [--base <ref>] [--skip-permissions] [--no-issues] [--force]` | Write `.orcaducho.json` for this repo and exclude `.orcaducho/` locally |
 | `orcaducho install [--dir <path>]` | Symlink the CLI onto your PATH |
 | `orcaducho hook guard\|gate\|post` | Hook entry points (used by `hooks/hooks.json`) |
 
@@ -194,6 +220,12 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 - **Workers are blocked by the gate.** The `check` command fails on the base branch too. Fix the base first, or adjust `check`.
 
 ## Update and uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zugazagoitia/orcaducho/main/install.sh | sh -s -- --update
+```
+
+or, inside Claude Code:
 
 ```
 /plugin marketplace update orcaducho

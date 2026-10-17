@@ -423,6 +423,29 @@ def cmd_hook(a: argparse.Namespace) -> None:
     {"guard": hook_guard, "gate": hook_gate, "post": hook_post}[a.which](event)
 
 
+# ---------------------------------------------------------------- init
+
+def cmd_init(a: argparse.Namespace) -> None:
+    """Write .orcaducho.json in the repo root and keep .orcaducho/ out of git (locally)."""
+    root = toplevel()
+    f = root / ".orcaducho.json"
+    if f.exists() and not a.force:
+        die(f"{f} already exists (use --force to overwrite)")
+    base = a.base or git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False).removeprefix("origin/")
+    cfg = {"check": a.check or "", "base": base, "issues": not a.no_issues,
+           "claudeArgs": ["--dangerously-skip-permissions"] if a.skip_permissions else ["--permission-mode", "acceptEdits"]}
+    f.write_text(json.dumps(cfg, indent=2) + "\n")
+    exclude = Path(git("rev-parse", "--git-path", "info/exclude"))
+    exclude = exclude if exclude.is_absolute() else root / exclude
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    if ".orcaducho/" not in (exclude.read_text() if exclude.exists() else ""):
+        with exclude.open("a") as fh:
+            fh.write("\n.orcaducho/\n")
+    print(json.dumps({"config": str(f), **cfg}))
+    if not cfg["check"]:
+        print("orcaducho: no --check given; the coordinator will fill it in on first run", file=sys.stderr)
+
+
 # ---------------------------------------------------------------- install
 
 def cmd_install(a: argparse.Namespace) -> None:
@@ -483,6 +506,14 @@ def main() -> None:
     s = sub.add_parser("hook", help="Claude Code hook entry point")
     s.add_argument("which", choices=("guard", "gate", "post"))
     s.set_defaults(fn=cmd_hook)
+
+    s = sub.add_parser("init", help="set up the current repo (.orcaducho.json, local ignore)")
+    s.add_argument("--check", help="verification command, e.g. 'pnpm typecheck && pnpm test'")
+    s.add_argument("--base", help="base branch (default: origin's default branch)")
+    s.add_argument("--no-issues", action="store_true", help="do not use GitHub issues")
+    s.add_argument("--skip-permissions", action="store_true", help="run agents with --dangerously-skip-permissions")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_init)
 
     s = sub.add_parser("install", help="symlink this CLI onto PATH")
     s.add_argument("--dir", default="~/.local/bin")
