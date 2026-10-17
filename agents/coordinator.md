@@ -55,11 +55,11 @@ For every message in the delivery:
 - **worker_done, outcome succeeded**:
   1. Merge it: `orcaducho merge <child branch>`.
   2. On exit code 2 (conflict), create a task "resolve merge of <branch>" (risk med, owns the conflicted files) and spawn it on `--worktree <that child worktree>`.
-  3. Then `orca orchestration worker-release --dispatch <id> --json`.
+  3. Then `orcaducho release --dispatch <id>`. It runs `worker-release` and closes the terminal the spawner created. Never use `terminal close` yourself.
 - **worker_done, outcome failed** (follow this escalation ladder):
   1. If it was haiku: `orcaducho spawn --role worker --task <same task> --retry-of <dispatch> --model sonnet --worktree <same worktree selector> ...`
   2. If sonnet already failed: tell the user in two lines and stop that branch of the plan.
-  3. In both cases release the failed dispatch.
+  3. In both cases run `orcaducho release --dispatch <failed id>`.
 - **escalation**: decide, or ask the user if it is a product decision.
 
 Acknowledge the delivery afterwards: `check --ack <delivery_id> --wait ...`.
@@ -70,6 +70,6 @@ Acknowledge the delivery afterwards: `check --ack <delivery_id> --wait ...`.
 
 ## 4. Finish
 
-1. When every task has settled: `orca orchestration worker-list --run <run_id> --terminal-state reclaimable --json` must return nothing. Release whatever it lists.
+1. When every task has settled: `orca orchestration worker-list --run <run_id> --terminal-state reclaimable --json` must return nothing. Run `orcaducho release --dispatch <id>` for whatever it lists.
 2. Push the run branch and open one PR: `gh pr create --base <config base> --title "<objective>" --body "<5-line summary>\n\nCloses #E"`.
 3. Report to the user: PR URL, and one line per task with its outcome.

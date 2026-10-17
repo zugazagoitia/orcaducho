@@ -36,6 +36,8 @@ You
 
 The coordinator also names each Orca Task with `--task-title` and `--display-name`. The role is therefore visible on the terminal tab, the worktree, the Task, and the Claude session.
 
+Orca treats a terminal bound with `--terminal` as *external*, so `worker-release` settles the worker but leaves the terminal open. `orcaducho release --dispatch <id>` runs `worker-release` first, then closes that terminal, and only once the worker has settled as succeeded or failed.
+
 ## State
 
 - **GitHub issues:** one epic issue per objective, with one sub-issue per task (labels `orcaducho`, `risk:*`). Workers' summaries are mirrored as comments by a hook. The final PR `Closes #epic`.
@@ -79,7 +81,11 @@ The coordinator writes this file on first use if it is missing.
 }
 ```
 
-`claudeArgs` are passed to every orcaducho session. Workers run unattended, so allow the Bash commands they need in your settings (`git`, `orca`, `orcaducho`, `gh`, and your check command). Use `bypassPermissions` only in a sandbox.
+`claudeArgs` are passed to every orcaducho session. Workers run unattended, so a permission prompt stalls them. Either allow the Bash commands they need in your settings (`git`, `orca`, `orcaducho`, `gh`, and your check command), or use `["--dangerously-skip-permissions"]` if that is how you already run Claude in Orca.
+
+## Development
+
+`ORCADUCHO_PLUGIN_DIR=/path/to/checkout` makes every session orcaducho starts, and the reviewer, load the plugin from that checkout with `--plugin-dir` instead of the installed copy. Child sessions inherit the setting.
 
 ## Hooks
 

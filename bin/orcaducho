@@ -105,9 +105,16 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "task"
 
 
+def plugin_dir_args() -> list[str]:
+    """ORCADUCHO_PLUGIN_DIR loads the plugin from a checkout instead of the installed copy (development)."""
+    d = os.environ.get("ORCADUCHO_PLUGIN_DIR")
+    return ["--plugin-dir", d] if d else []
+
+
 def claude_cmd(role: str, model: str, effort: str | None, name: str, env: dict[str, str], cfg: dict, prompt: str | None = None) -> str:
+    env = {**env, "ORCADUCHO_MODEL": model, "ORCADUCHO_PLUGIN_DIR": os.environ.get("ORCADUCHO_PLUGIN_DIR", "")}
     parts = ["env", *(f"{k}={v}" for k, v in env.items() if v)]
-    parts += ["claude", "--agent", f"{PLUGIN}:{role}", "--model", model, "-n", name]
+    parts += ["claude", *plugin_dir_args(), "--agent", f"{PLUGIN}:{role}", "--model", model, "-n", name]
     if effort:
         parts += ["--effort", effort]
     parts += list(cfg.get("claudeArgs") or [])
@@ -179,6 +186,7 @@ def cmd_spawn(a: argparse.Namespace) -> None:
         "ORCADUCHO_ISSUE": a.issue or "",
         "ORCADUCHO_OWNS": a.owns or "",
         "ORCADUCHO_BASE": base_sha,
+        "ORCADUCHO_READONLY": "1" if a.worktree == "current" else "",
     }
     model = a.model or DEFAULT_MODEL[a.role]
     term = orca("terminal", "create", "--worktree", selector, "--title", name,
@@ -197,6 +205,25 @@ def cmd_spawn(a: argparse.Namespace) -> None:
     dispatch = find(res, lambda k, v: k in ("dispatchId", "dispatch_id") and isinstance(v, str))
     print(json.dumps({"task": a.task, "dispatch": dispatch, "handle": handle, "worktree": selector, "branch": branch,
                       "agent": f"{PLUGIN}:{a.role}", "model": model, "name": name}))
+
+
+# ---------------------------------------------------------------- release
+
+def cmd_release(a: argparse.Namespace) -> None:
+    """worker-release, then close the terminal orcaducho created.
+
+    `worker-start --terminal` makes Orca treat the terminal as external, so release settles the
+    worker but retains the terminal. Close it only after an accepted settlement.
+    """
+    rel = orca("orchestration", "worker-release", "--dispatch", a.dispatch)
+    show = orca("orchestration", "worker-show", "--dispatch", a.dispatch, check=False).get("result") or {}
+    worker = show.get("worker") or {}
+    handle, state = worker.get("agentTerminalHandle"), worker.get("state")
+    external = (show.get("terminalResource") or {}).get("ownershipState") == "external"
+    closed = False
+    if handle and external and state in ("succeeded", "failed"):
+        closed = orca("terminal", "close", "--terminal", handle, check=False).get("ok", False)
+    print(json.dumps({"dispatch": a.dispatch, "released": rel.get("ok"), "state": state, "terminal": handle, "closed": closed}))
 
 
 # ---------------------------------------------------------------- merge
@@ -301,7 +328,9 @@ def hook_guard(event: dict) -> None:
 
 
 def gate_failures(add: bool = False) -> int:
-    f = Path(git("rev-parse", "--git-dir")) / f"orcaducho-gate-{os.environ.get('ORCADUCHO_TASK', 'x')}"
+    # Keyed by model too, so a Sonnet retry of a task Haiku failed starts with a fresh budget.
+    key = f"{os.environ.get('ORCADUCHO_TASK', 'x')}-{os.environ.get('ORCADUCHO_MODEL', 'x')}"
+    f = Path(git("rev-parse", "--absolute-git-dir")) / f"orcaducho-gate-{key}"
     n = int(f.read_text()) if f.exists() else 0
     if add:
         n += 1
@@ -327,8 +356,11 @@ def hook_gate(event: dict) -> None:
         return
     if gate_failures() >= MAX_GATE_FAILURES:
         deny("Gate already failed twice for this task: send worker_done with --outcome failed.")
+    if os.environ.get("ORCADUCHO_READONLY"):
+        return  # read-only task in a shared worktree: nothing of its own to gate
     cwd = event.get("cwd") or os.getcwd()
-    if git("status", "--porcelain", cwd=cwd):
+    dirty = [l for l in git("status", "--porcelain", cwd=cwd).splitlines() if not l[3:].startswith(".orcaducho")]
+    if dirty:
         deny("Commit all changes (git add -A && git commit) before worker_done.")
 
     check = config(cwd).get("check")
@@ -353,7 +385,7 @@ def hook_gate(event: dict) -> None:
               f"```diff\n{diff}\n```")
     env = {**os.environ, "ORCADUCHO_ROLE": "reviewer"}
     try:
-        p = subprocess.run(["claude", "-p", "--agent", f"{PLUGIN}:reviewer", "--model", REVIEW_MODEL[risk], prompt],
+        p = subprocess.run(["claude", "-p", *plugin_dir_args(), "--agent", f"{PLUGIN}:reviewer", "--model", REVIEW_MODEL[risk], prompt],
                            cwd=cwd, capture_output=True, text=True, timeout=600, env=env)
     except subprocess.TimeoutExpired:
         return  # a stuck reviewer must not block delivery; checks already passed
@@ -431,6 +463,10 @@ def main() -> None:
     s.add_argument("--retry-of")
     s.add_argument("--run")
     s.set_defaults(fn=cmd_spawn)
+
+    s = sub.add_parser("release", help="release a settled worker and close its orcaducho terminal")
+    s.add_argument("--dispatch", required=True)
+    s.set_defaults(fn=cmd_release)
 
     s = sub.add_parser("merge", help="merge a child branch into the current branch")
     s.add_argument("branch")
