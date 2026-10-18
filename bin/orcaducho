@@ -22,6 +22,9 @@ DEFAULT_MODEL = {"coordinator": "opus", "lead": "sonnet", "worker": "haiku"}
 REVIEW_MODEL = {"med": "haiku", "high": "sonnet"}
 MAX_GATE_FAILURES = 2  # first failure: worker fixes; second: report failed so the coordinator escalates
 DIFF_LIMIT = 60_000
+# Auto mode: a classifier approves routine actions, so unattended sessions do not stall on prompts.
+DEFAULT_CLAUDE_ARGS = ("--permission-mode", "auto")
+SKIP_PERMISSIONS_ARGS = ("--dangerously-skip-permissions",)
 
 
 # ---------------------------------------------------------------- helpers
@@ -86,7 +89,8 @@ def toplevel(cwd: str | None = None) -> Path:
 
 
 def config(cwd: str | None = None) -> dict:
-    cfg = {"check": "", "base": "", "issues": True, "claudeArgs": ["--permission-mode", "acceptEdits"]}
+    cfg = {"check": "", "base": "", "issues": True, "lang": "en", "autonomous": True, "advisor": "",
+           "claudeArgs": list(DEFAULT_CLAUDE_ARGS)}
     try:
         f = toplevel(cwd) / ".orcaducho.json"
         if f.exists():
@@ -118,6 +122,8 @@ def claude_argv(role: str, model: str, effort: str | None, name: str, env: dict[
     argv += ["claude", *plugin_dir_args(), "--agent", f"{PLUGIN}:{role}", "--model", model, "-n", name]
     if effort:
         argv += ["--effort", effort]
+    if cfg.get("advisor") and role != "coordinator":
+        argv += ["--advisor", cfg["advisor"]]  # cheap model, stronger advisor at decision points
     argv += list(cfg.get("claudeArgs") or [])
     if prompt:
         argv.append(prompt)
@@ -141,17 +147,36 @@ def launcher(argv: list[str], key: str) -> str:
 
 # ---------------------------------------------------------------- start
 
+def coordinator_prompt(objective: str, cfg: dict) -> str | None:
+    """The objective plus the standing authorisation an unattended run needs.
+
+    Auto mode reads approvals stated in the conversation, and repos often say outward actions need a
+    human request, so the user's go-ahead for the run's own branch and PR is written down once here.
+    """
+    if not objective:
+        return None  # resume: the coordinator continues from .orcaducho/plan.md
+    if not cfg.get("autonomous", True):
+        return objective
+    base = cfg.get("base") or "the configured base branch"
+    return (f"{objective}\n\n(orcaducho run, unattended: nobody answers questions or permission prompts. "
+            f"You are authorised to create the planned issues, push the run branch and its child branches, "
+            f"and open one PR against {base}. Decide product questions yourself as described in your instructions.)")
+
+
 def cmd_start(a: argparse.Namespace) -> None:
     """Launch the Opus coordinator, named, inside an Orca terminal."""
     objective = " ".join(a.objective).strip()
     cfg = config()
+    if a.base:
+        cfg["base"] = a.base
+    prompt = coordinator_prompt(objective, cfg)
     env = {"ORCADUCHO_ROLE": "coordinator"}
     if not a.name:
         if not os.environ.get("ORCA_TERMINAL_HANDLE"):
             die("run inside an Orca terminal, or pass --name to create a new worktree for the run")
         name = label("coordinator", objective or "session")
         orca("terminal", "rename", "--terminal", os.environ["ORCA_TERMINAL_HANDLE"], "--title", name, check=False)
-        argv = claude_argv("coordinator", a.model, a.effort, name, env, cfg, objective or None)
+        argv = claude_argv("coordinator", a.model, a.effort, name, env, cfg, prompt)
         os.execvp(argv[0], argv)
 
     base = a.base or cfg.get("base") or ""
@@ -165,7 +190,7 @@ def cmd_start(a: argparse.Namespace) -> None:
     name = label("coordinator", objective or a.name)
     orca("worktree", "set", "--worktree", f"id:{wt_id}", "--display-name", name, check=False)
     term = orca("terminal", "create", "--worktree", f"id:{wt_id}", "--title", name,
-                "--command", launcher(claude_argv("coordinator", a.model, a.effort, name, env, cfg, objective or None),
+                "--command", launcher(claude_argv("coordinator", a.model, a.effort, name, env, cfg, prompt),
                                       f"coordinator-{a.name}"))
     handle = find(term, lambda k, v: k == "handle" and isinstance(v, str))
     print(json.dumps({"worktree": wt_id, "handle": handle, "name": name}))
@@ -258,6 +283,23 @@ def cmd_merge(a: argparse.Namespace) -> None:
     sys.exit(2)
 
 
+# ---------------------------------------------------------------- review
+
+def cmd_review(a: argparse.Namespace) -> None:
+    """Review the whole run branch against its base before the PR (one headless reviewer call)."""
+    base = a.base or config().get("base") or "HEAD~1"
+    ref = f"origin/{base}" if git("rev-parse", "--verify", "-q", f"origin/{base}", check=False) else base
+    diff = git("diff", f"{ref}...HEAD")[:DIFF_LIMIT]
+    if not diff:
+        print("PASS")
+        return
+    verdict = review(diff, a.model, f"the whole orcaducho run branch (against {ref}); flag only cross-task defects "
+                                    f"such as broken integration between the parts")
+    print(verdict or "PASS")
+    if verdict.upper().startswith("FAIL"):
+        sys.exit(3)
+
+
 # ---------------------------------------------------------------- issues
 
 def issues_enabled() -> bool:
@@ -272,15 +314,132 @@ def ensure_labels() -> None:
         run(["gh", "label", "create", name, "--color", color, "--force"], check=False)
 
 
+TEXT = {
+    "en": {
+        "risk": {"low": "🟢 low", "med": "🟡 medium", "high": "🔴 high"},
+        "task": "orcaducho task · risk {risk}", "part_of": "part of #{n}",
+        "Change": "What to do", "Target": "Where", "Ownership": "Files it may change",
+        "Constraints": "Constraints", "Acceptance": "Done when", "Notes": "Notes",
+        "spec": "🤖 Agent spec (what the worker receives)",
+        "epic": "orcaducho run. The tasks are this issue's sub-issues; GitHub shows their progress above.",
+        "goal": "Goal", "plan": "🤖 Plan as the coordinator wrote it",
+        "outcome": {"succeeded": "✅ {role} · succeeded", "failed": "❌ {role} · failed"},
+        "other": "ℹ️ {role} · {outcome}",
+    },
+    "es": {
+        "risk": {"low": "🟢 bajo", "med": "🟡 medio", "high": "🔴 alto"},
+        "task": "Tarea de orcaducho · riesgo {risk}", "part_of": "parte de #{n}",
+        "Change": "Qué hay que hacer", "Target": "Dónde", "Ownership": "Ficheros que puede tocar",
+        "Constraints": "Restricciones", "Acceptance": "Hecho cuando", "Notes": "Notas",
+        "spec": "🤖 Especificación para agentes (lo que recibe el worker)",
+        "epic": "Ejecución de orcaducho. Las tareas son los sub-issues de este issue; GitHub muestra su progreso arriba.",
+        "goal": "Objetivo", "plan": "🤖 Plan tal como lo escribió el coordinador",
+        "outcome": {"succeeded": "✅ {role} · completado", "failed": "❌ {role} · fallido"},
+        "other": "ℹ️ {role} · {outcome}",
+    },
+}
+
+# The coordinator writes specs as "Label: text" sections; these are the labels it uses, with aliases.
+SPEC_LABELS = {"target": "Target", "change": "Change", "constraints": "Constraints", "ownership": "Ownership",
+               "owns": "Ownership", "acceptance": "Acceptance", "observable acceptance": "Acceptance",
+               "notes": "Notes"}
+SPEC_RE = re.compile(r"^\s*(" + "|".join(sorted(map(re.escape, SPEC_LABELS), key=len, reverse=True)) + r")\s*:\s*",
+                     re.IGNORECASE | re.MULTILINE)
+SECTION_ORDER = ("Change", "Target", "Ownership", "Constraints", "Acceptance", "Notes")
+
+
+def text(cfg: dict) -> dict:
+    return TEXT.get(str(cfg.get("lang") or "en").lower()[:2], TEXT["en"])
+
+
+def parse_spec(spec: str) -> tuple[str, dict[str, str]]:
+    """Split a compact spec into (intro, {section: text}). Unlabelled text before the first label is the intro."""
+    matches = list(SPEC_RE.finditer(spec))
+    if not matches:
+        return spec.strip(), {}
+    sections: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(spec)
+        key = SPEC_LABELS[m.group(1).lower()]
+        body = spec[m.end():end].strip()
+        sections[key] = f"{sections[key]}\n{body}" if key in sections else body
+    return spec[:matches[0].start()].strip(), sections
+
+
+def split_items(value: str, sep: str) -> list[str]:
+    items = [i.strip().rstrip(".").strip() for part in value.splitlines() for i in part.split(sep)]
+    return [i.lstrip("-* ").strip() for i in items if i.strip("-* ")]
+
+
+def fenced(raw: str) -> str:
+    fence = "~~~~" if "~~~" in raw else "~~~"
+    return f"{fence}text\n{raw.strip()}\n{fence}"
+
+
+def details(summary: str, raw: str) -> str:
+    return f"<details>\n<summary>{summary}</summary>\n\n{fenced(raw)}\n\n</details>"
+
+
+def render_task(spec: str, risk: str, parent: str | None, cfg: dict) -> str:
+    """Human-readable issue body; the compact spec stays verbatim in a collapsed block for agents and audits."""
+    t = text(cfg)
+    intro, sections = parse_spec(spec)
+    if not sections:
+        return spec  # nothing structured to render
+    head = t["task"].format(risk=t["risk"].get(risk, risk))
+    if parent and parent != "-":
+        head += " · " + t["part_of"].format(n=parent)
+    out = [f"> {head}"]
+    if intro:
+        out.append(intro)
+    for key in SECTION_ORDER:
+        value = sections.get(key)
+        if not value:
+            continue
+        if key == "Ownership":
+            value = "\n".join(f"- `{g}`" for g in split_items(value, ","))
+        elif key == "Acceptance":
+            value = "\n".join(f"- [ ] {i}" for i in split_items(value, ";"))
+        out.append(f"### {t[key]}\n{value}")
+    out.append(details(t["spec"], spec))
+    return "\n\n".join(out) + "\n"
+
+
+def render_epic(body: str, goal: str | None, cfg: dict) -> str:
+    t = text(cfg)
+    if not goal:
+        return f"> {t['epic']}\n\n{body}".rstrip() + "\n"
+    out = [f"> {t['epic']}", f"### {t['goal']}\n{goal.strip()}"]
+    if body.strip():
+        out.append(details(t["plan"], body))
+    return "\n\n".join(out) + "\n"
+
+
+def render_result(role: str, outcome: str, subject: str, body: str, model: str, cfg: dict) -> str:
+    t = text(cfg)
+    head = t["outcome"].get(outcome, t["other"]).format(role=role, outcome=outcome)
+    out = [f"### {head}"]
+    if subject:
+        out.append(f"**{subject}**")
+    if body:
+        out.append(body)
+    out.append(f"<sub>orcaducho · {model or '?'}</sub>")
+    return "\n\n".join(out)
+
+
 def cmd_issue(a: argparse.Namespace) -> None:
     if not issues_enabled():
         print("-")  # issues off: callers treat "-" as "no issue"
         return
     ensure_labels()
+    cfg = config()
     labels = ["--label", "orcaducho"]
     if a.kind == "task":
         labels += ["--label", f"risk:{a.risk}"]
-    url = run(["gh", "issue", "create", "--title", a.title, "--body", a.body or "", *labels]).stdout.strip()
+        body = render_task(a.body or "", a.risk, a.parent, cfg)
+    else:
+        body = render_epic(a.body or "", a.goal, cfg)
+    url = run(["gh", "issue", "create", "--title", a.title, "--body", body, *labels]).stdout.strip()
     number = url.rstrip("/").rsplit("/", 1)[-1]
     if a.kind == "task" and a.parent and a.parent != "-":
         repo = run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]).stdout.strip()
@@ -288,6 +447,26 @@ def cmd_issue(a: argparse.Namespace) -> None:
         run(["gh", "api", "-X", "POST", f"repos/{repo}/issues/{a.parent}/sub_issues",
              "-F", f"sub_issue_id={sub_id}"], check=False)
     print(number)
+
+
+def cmd_refresh(a: argparse.Namespace) -> None:
+    """Re-render raw-spec issues written by orcaducho < 0.4 (risk from labels, parent from the sub-issue link)."""
+    if not issues_enabled():
+        die("issues are off for this repo")
+    cfg = config()
+    repo = run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]).stdout.strip()
+    for n in a.numbers:
+        info = json.loads(run(["gh", "issue", "view", n, "--json", "body,labels"]).stdout)
+        body = info.get("body") or ""
+        if "<details>" in body:
+            print(json.dumps({"issue": n, "refreshed": False, "reason": "already rendered"}))
+            continue
+        risk = next((l["name"][5:] for l in info.get("labels", []) if l["name"].startswith("risk:")), "low")
+        parent = run(["gh", "api", f"repos/{repo}/issues/{n}/parent", "-q", ".number"], check=False).stdout.strip() or None
+        new = render_task(body, risk, parent, cfg)
+        if new != body:
+            run(["gh", "issue", "edit", n, "--body", new])
+        print(json.dumps({"issue": n, "refreshed": new != body}))
 
 
 # ---------------------------------------------------------------- hooks
@@ -398,18 +577,74 @@ def hook_gate(event: dict) -> None:
     diff = git("diff", f"{base}...HEAD", cwd=cwd)[:DIFF_LIMIT]  # three dots: only this branch's changes
     if not diff:
         return
-    spec = os.environ.get("ORCADUCHO_TASK", "")
-    prompt = (f"Review this diff for Orca task {spec} (risk: {risk}). Answer per your instructions.\n\n"
-              f"```diff\n{diff}\n```")
-    env = {**os.environ, "ORCADUCHO_ROLE": "reviewer"}
-    try:
-        p = subprocess.run(["claude", "-p", *plugin_dir_args(), "--agent", f"{PLUGIN}:reviewer", "--model", REVIEW_MODEL[risk], prompt],
-                           cwd=cwd, capture_output=True, text=True, timeout=600, env=env)
-    except subprocess.TimeoutExpired:
-        return  # a stuck reviewer must not block delivery; checks already passed
-    verdict = p.stdout.strip()
+    verdict = review(diff, REVIEW_MODEL[risk], f"Orca task {os.environ.get('ORCADUCHO_TASK', '')} (risk: {risk})", cwd)
     if verdict.upper().startswith("FAIL"):
         gate_fail(f"{REVIEW_MODEL[risk]} review failed:\n{verdict[:1500]}")
+
+
+def review(diff: str, model: str, what: str, cwd: str | None = None) -> str:
+    """Run the headless reviewer agent on a diff; returns its PASS/FAIL text ("PASS" if it times out)."""
+    prompt = f"Review this diff for {what}. Answer per your instructions.\n\n```diff\n{diff}\n```"
+    env = {**os.environ, "ORCADUCHO_ROLE": "reviewer"}
+    try:
+        p = subprocess.run(["claude", "-p", *plugin_dir_args(), "--agent", f"{PLUGIN}:reviewer", "--model", model, prompt],
+                           cwd=cwd, capture_output=True, text=True, timeout=600, env=env)
+    except subprocess.TimeoutExpired:
+        return "PASS"  # a stuck reviewer must not block delivery; checks already passed
+    return p.stdout.strip()
+
+
+AUTONOMY = {
+    "coordinator": ("Nobody is watching this orcaducho run. Decide yourself: choose the conservative option that "
+                    "keeps the plan moving, record the assumption in .orcaducho/plan.md and on the epic issue as "
+                    "\"to confirm\", and continue."),
+    "lead": "Nobody is watching this orcaducho run. Ask your coordinator with your preamble's `ask` command instead, or decide yourself.",
+    "worker": "Nobody is watching this orcaducho run. Ask the coordinator with your preamble's `ask` command instead, or decide yourself.",
+}
+
+
+def autonomous(event: dict) -> bool:
+    return bool(config(event.get("cwd")).get("autonomous", True))
+
+
+def hook_ask(event: dict) -> None:
+    """AskUserQuestion would wait for a human forever: answer it with the escalation route instead."""
+    role = os.environ.get("ORCADUCHO_ROLE", "")
+    if role in AUTONOMY and autonomous(event):
+        deny(AUTONOMY[role])
+
+
+def hook_permission(event: dict) -> None:
+    """A permission prompt would stall an unattended session: deny it and say how to proceed."""
+    role = os.environ.get("ORCADUCHO_ROLE", "")
+    if role not in AUTONOMY or not autonomous(event):
+        return
+    escalate = ("record it as blocked in .orcaducho/plan.md and continue with the rest" if role == "coordinator"
+                else "report it with your preamble's `ask`, or send worker_done --outcome failed if the task cannot be done without it")
+    message = (f"No one approves permission prompts in an orcaducho run, so {event.get('tool_name', 'this tool')} was denied. "
+               f"Find a way that needs no approval; otherwise {escalate}.")
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                             "decision": {"behavior": "deny", "message": message}}}))
+
+
+def run_finished(cwd: str | None) -> bool:
+    plan = toplevel(cwd) / ".orcaducho" / "plan.md"
+    try:
+        return bool(re.search(r"^\s*status:\s*(done|stopped)\b", plan.read_text(), re.IGNORECASE | re.MULTILINE))
+    except OSError:
+        return False
+
+
+def hook_stop(event: dict) -> None:
+    """Keep the coordinator looping until plan.md says the run is done (Claude Code caps consecutive continuations)."""
+    if os.environ.get("ORCADUCHO_ROLE") != "coordinator" or not autonomous(event) or run_finished(event.get("cwd")):
+        return
+    if event.get("background_tasks"):
+        return  # background work will wake the session on its own
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": (
+        "The orcaducho run is not finished. Continue the coordinator loop (`orca orchestration check --wait ...`). "
+        "When every task has settled and the PR is open, add the line `Status: done` to .orcaducho/plan.md; "
+        "if the run cannot continue at all, add `Status: stopped` with one line saying why.")}}))
 
 
 def hook_post(event: dict) -> None:
@@ -424,7 +659,8 @@ def hook_post(event: dict) -> None:
         return
     opts = {argv[i]: argv[i + 1] for i in range(len(argv) - 1) if argv[i].startswith("--")}
     outcome = opts.get("--outcome", "unknown")
-    body = f"**{os.environ.get('ORCADUCHO_ROLE')} · {outcome}** — {opts.get('--subject', '')}\n\n{opts.get('--body', '')}"
+    body = render_result(os.environ.get("ORCADUCHO_ROLE", "?"), outcome, opts.get("--subject", ""),
+                         opts.get("--body", ""), os.environ.get("ORCADUCHO_MODEL", ""), config(event.get("cwd")))
     subprocess.Popen(["gh", "issue", "comment", issue, "--body", body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if outcome == "failed":
         subprocess.Popen(["gh", "issue", "edit", issue, "--add-label", "status:failed"],
@@ -438,10 +674,31 @@ def cmd_hook(a: argparse.Namespace) -> None:
         event = json.load(sys.stdin)
     except json.JSONDecodeError:
         return
-    {"guard": hook_guard, "gate": hook_gate, "post": hook_post}[a.which](event)
+    {"guard": hook_guard, "gate": hook_gate, "post": hook_post, "ask": hook_ask,
+     "permission": hook_permission, "stop": hook_stop}[a.which](event)
 
 
 # ---------------------------------------------------------------- init
+
+def detect_check(root: Path) -> str:
+    """Guess the fast verification command from the project files, so no agent spends tokens on it."""
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            scripts = json.loads(pkg.read_text()).get("scripts") or {}
+        except (json.JSONDecodeError, AttributeError):
+            scripts = {}
+        pm = next((m for f, m in (("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lockb", "bun"),
+                                  ("bun.lock", "bun")) if (root / f).exists()), "npm")
+        run_cmd = "npm run" if pm == "npm" else pm
+        steps = [s for s in ("typecheck", "lint", "test") if s in scripts]
+        return " && ".join(f"{run_cmd} {s}" for s in steps)
+    for marker, cmd in (("Cargo.toml", "cargo check && cargo test"), ("go.mod", "go vet ./... && go test ./..."),
+                        ("pyproject.toml", "python3 -m pytest -q")):
+        if (root / marker).exists():
+            return cmd
+    return ""
+
 
 def cmd_init(a: argparse.Namespace) -> None:
     """Write .orcaducho.json in the repo root and keep .orcaducho/ out of git (locally)."""
@@ -450,8 +707,9 @@ def cmd_init(a: argparse.Namespace) -> None:
     if f.exists() and not a.force:
         die(f"{f} already exists (use --force to overwrite)")
     base = a.base or git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False).removeprefix("origin/")
-    cfg = {"check": a.check or "", "base": base, "issues": not a.no_issues,
-           "claudeArgs": ["--dangerously-skip-permissions"] if a.skip_permissions else ["--permission-mode", "acceptEdits"]}
+    cfg = {"check": a.check if a.check is not None else detect_check(root), "base": base, "issues": not a.no_issues,
+           "lang": a.lang, "autonomous": not a.supervised, "advisor": a.advisor or "",
+           "claudeArgs": list(SKIP_PERMISSIONS_ARGS if a.skip_permissions else DEFAULT_CLAUDE_ARGS)}
     f.write_text(json.dumps(cfg, indent=2) + "\n")
     exclude = Path(git("rev-parse", "--git-path", "info/exclude"))
     exclude = exclude if exclude.is_absolute() else root / exclude
@@ -461,7 +719,7 @@ def cmd_init(a: argparse.Namespace) -> None:
             fh.write("\n.orcaducho/\n")
     print(json.dumps({"config": str(f), **cfg}))
     if not cfg["check"]:
-        print("orcaducho: no --check given; the coordinator will fill it in on first run", file=sys.stderr)
+        print("orcaducho: no check command found; pass --check, or the coordinator fills it in on first run", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- install
@@ -513,23 +771,38 @@ def main() -> None:
     s.add_argument("branch")
     s.set_defaults(fn=cmd_merge)
 
+    s = sub.add_parser("review", help="review the run branch against its base (exit 3 on FAIL)")
+    s.add_argument("--base", help="default: config base")
+    s.add_argument("--model", default="sonnet")
+    s.set_defaults(fn=cmd_review)
+
     s = sub.add_parser("issue", help="create an epic or task issue (prints its number, or '-')")
     s.add_argument("kind", choices=("epic", "task"))
     s.add_argument("--title", required=True)
-    s.add_argument("--body")
+    s.add_argument("--body", help="task: the compact spec (Target/Change/Constraints/Ownership/Acceptance); epic: the plan")
+    s.add_argument("--goal", help="epic: one human-readable paragraph; --body then goes in a collapsed block")
     s.add_argument("--parent")
     s.add_argument("--risk", choices=("low", "med", "high"), default="low")
     s.set_defaults(fn=cmd_issue)
 
+    s = sub.add_parser("refresh", help="re-render task issues written as raw specs (orcaducho < 0.4)")
+    s.add_argument("numbers", nargs="+")
+    s.set_defaults(fn=cmd_refresh)
+
     s = sub.add_parser("hook", help="Claude Code hook entry point")
-    s.add_argument("which", choices=("guard", "gate", "post"))
+    s.add_argument("which", choices=("guard", "gate", "post", "ask", "permission", "stop"))
     s.set_defaults(fn=cmd_hook)
 
     s = sub.add_parser("init", help="set up the current repo (.orcaducho.json, local ignore)")
-    s.add_argument("--check", help="verification command, e.g. 'pnpm typecheck && pnpm test'")
+    s.add_argument("--check", help="verification command (default: detected from package.json, Cargo.toml, go.mod, pyproject.toml)")
     s.add_argument("--base", help="base branch (default: origin's default branch)")
     s.add_argument("--no-issues", action="store_true", help="do not use GitHub issues")
-    s.add_argument("--skip-permissions", action="store_true", help="run agents with --dangerously-skip-permissions")
+    s.add_argument("--skip-permissions", action="store_true",
+                   help="run agents with --dangerously-skip-permissions instead of auto mode (containers/VMs only)")
+    s.add_argument("--lang", default="en", help="language of the issues orcaducho writes: en or es (default en)")
+    s.add_argument("--advisor", help="advisor model for leads and workers, e.g. opus (Anthropic API only)")
+    s.add_argument("--supervised", action="store_true",
+                   help="let agents ask you questions and permission prompts (default: fully autonomous)")
     s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_init)
 

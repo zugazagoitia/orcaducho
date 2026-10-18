@@ -1,5 +1,5 @@
 {
-  "description": "orcaducho gates. Inert unless ORCADUCHO_ROLE is set (sessions launched by orcaducho).",
+  "description": "orcaducho gates and autonomy. Inert unless ORCADUCHO_ROLE is set (sessions launched by orcaducho).",
   "hooks": {
     "PreToolUse": [
       {
@@ -21,6 +21,27 @@
             "timeout": 1800
           }
         ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/orcaducho\" hook ask",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/orcaducho\" hook permission",
+            "timeout": 15
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -30,6 +51,17 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/orcaducho\" hook post",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/orcaducho\" hook stop",
             "timeout": 15
           }
         ]

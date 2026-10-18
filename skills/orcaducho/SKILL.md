@@ -11,8 +11,8 @@ Launch the coordinator. Do not plan or implement the objective yourself, since t
    ```
    orcaducho start --name "<run name>" "<objective>"
    ```
-   If `orcaducho` is not on PATH, use `python3 "${CLAUDE_PLUGIN_ROOT}/bin/orcaducho"` instead, and suggest running `orcaducho install` once.
-   The command creates a run worktree and an Orca terminal titled `orcaducho:coordinator · …`, running `claude --agent orcaducho:coordinator --model opus`.
+   The plugin puts `orcaducho` on the Bash tool's PATH. If it is still not found, use `python3 "${CLAUDE_PLUGIN_ROOT}/bin/orcaducho"` instead.
+   The command creates a run worktree and an Orca terminal titled `orcaducho:coordinator · …`, running `claude --agent orcaducho:coordinator --model opus` in auto mode. The run is unattended: the coordinator and its agents decide on their own and never wait for the user.
 3. Reply in at most two lines: the worktree and terminal handle it printed, and that progress is visible in Orca and on the epic issue.
 
 To resume a run, open the coordinator's terminal in Orca. If it was closed, run `orcaducho start` from inside the run worktree's Orca terminal; the coordinator resumes from `.orcaducho/plan.md`.
