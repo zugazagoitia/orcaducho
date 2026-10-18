@@ -213,6 +213,7 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 | `orcaducho issue epic\|task --title "<t>" [--body "<b>"] [--goal "<g>"] [--parent <n>] [--risk <r>]` | Create an issue or sub-issue; prints its number, or `-` if issues are off. A task `--body` with `Target:`/`Change:`/`Constraints:`/`Ownership:`/`Acceptance:` labels is rendered for humans; an epic `--goal` is shown and `--body` collapsed |
 | `orcaducho refresh <n>...` | Re-render task issues created as raw specs by orcaducho < 0.4 |
 | `orcaducho init [--check "<cmd>"] [--base <ref>] [--lang en\|es] [--advisor <model>] [--skip-permissions] [--supervised] [--no-issues] [--force]` | Write `.orcaducho.json` for this repo and exclude `.orcaducho/` locally |
+| `orcaducho update [--auto-only]` | Update the plugin and CLI now, and turn on background auto-update (`--auto-only`: only the latter) |
 | `orcaducho install [--dir <path>]` | Symlink the CLI onto your PATH |
 | `orcaducho hook guard\|gate\|post\|ask\|permission\|stop` | Hook entry points (used by `hooks/hooks.json`) |
 
@@ -235,6 +236,7 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 | Variable | Meaning |
 |---|---|
 | `ORCADUCHO_PLUGIN_DIR` | Load the plugin from this checkout (`--plugin-dir`) instead of the installed copy; inherited by child sessions |
+| `ORCADUCHO_NO_UPDATE` | Skip the daily update check in `orcaducho start` |
 | `ORCA_CLI_COMMAND` | Orca executable to use (otherwise `orca`, or `orca-ide` on Linux outside Orca terminals) |
 | `ORCADUCHO_ROLE`, `_TASK`, `_RISK`, `_ISSUE`, `_OWNS`, `_BASE`, `_MODEL`, `_READONLY` | Set by `orcaducho spawn` for each session; do not set by hand |
 
@@ -248,6 +250,21 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 - **Workers are blocked by the gate.** The `check` command fails on the base branch too. Fix the base first, or adjust `check`.
 
 ## Update and uninstall
+
+orcaducho keeps itself up to date:
+
+- **Background auto-update.** `install.sh` (or `orcaducho update`) sets `extraKnownMarketplaces.orcaducho.autoUpdate` in `~/.claude/settings.json`; Claude Code has this off by default for third-party marketplaces. Claude Code then refreshes the plugin in the background during sessions, and new sessions load the new version.
+- **Daily check before a run.** `orcaducho start` updates at most once every 24 hours before launching the coordinator, and reruns itself if the version changed, so a new run always starts on the latest release. Set `ORCADUCHO_NO_UPDATE=1` to skip it. It is also skipped when `ORCADUCHO_PLUGIN_DIR` points at a development checkout.
+
+The `orcaducho` CLI is a symlink into the marketplace checkout, so it updates together with the plugin. Sessions already running keep the version they loaded.
+
+To update right away:
+
+```sh
+orcaducho update
+```
+
+or:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zugazagoitia/orcaducho/main/install.sh | sh -s -- --update

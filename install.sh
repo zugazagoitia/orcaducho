@@ -1,7 +1,8 @@
 #!/bin/sh
 # One-line setup for orcaducho (macOS and Linux; works from sh, bash, zsh and fish):
 #   curl -fsSL https://raw.githubusercontent.com/zugazagoitia/orcaducho/main/install.sh | sh
-# Safe to re-run: every step is idempotent. Append `-s -- --update` after `sh` to pull the latest version.
+# Safe to re-run: every step is idempotent. Append `-s -- --update` after `sh` to pull the latest version now;
+# afterwards the plugin and CLI keep themselves up to date (Claude Code auto-update + a daily check in `orcaducho start`).
 # Strictly POSIX sh: no bashisms, so it runs under dash on Debian/Ubuntu too.
 set -eu
 
@@ -23,6 +24,8 @@ fi
 claude plugin install orcaducho@orcaducho
 
 python3 "$MARKET_DIR/bin/orcaducho" install --dir "$BIN_DIR"
+# Third-party marketplaces do not auto-update by default; turn it on for this one.
+python3 "$MARKET_DIR/bin/orcaducho" update --auto-only >/dev/null
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

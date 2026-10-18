@@ -164,5 +164,44 @@ class InitTest(unittest.TestCase):
         self.assertEqual(od.coordinator_prompt("do x", {"autonomous": False}), "do x")
 
 
+class UpdateTest(unittest.TestCase):
+    def test_enable_auto_update_keeps_other_settings(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
+            f = Path(d) / "settings.json"
+            f.write_text(json.dumps({"model": "opus", "extraKnownMarketplaces": {"other": {"x": 1}}}))
+            self.assertTrue(od.enable_auto_update())
+            data = json.loads(f.read_text())
+            self.assertEqual(data["model"], "opus")
+            self.assertEqual(data["extraKnownMarketplaces"]["other"], {"x": 1})
+            self.assertTrue(data["extraKnownMarketplaces"]["orcaducho"]["autoUpdate"])
+            self.assertEqual(data["extraKnownMarketplaces"]["orcaducho"]["source"]["repo"], "zugazagoitia/orcaducho")
+
+    def test_unparseable_settings_are_left_alone(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
+            (Path(d) / "settings.json").write_text("{not json")
+            self.assertFalse(od.enable_auto_update())
+            self.assertEqual((Path(d) / "settings.json").read_text(), "{not json")
+
+    def test_maybe_update_is_throttled(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}), \
+                mock.patch.object(od, "update_now") as upd, mock.patch.object(od.shutil, "which", return_value="/bin/claude"):
+            os.environ.pop("ORCADUCHO_PLUGIN_DIR", None)
+            os.environ.pop("ORCADUCHO_NO_UPDATE", None)
+            stamp = Path(d) / "plugins" / "data" / "orcaducho-orcaducho" / "last-update-check"
+            stamp.parent.mkdir(parents=True)
+            stamp.write_text(str(int(od.time.time())))
+            od.maybe_update()
+            upd.assert_not_called()
+            stamp.write_text("0")
+            upd.return_value = {"ok": True, "from": "1", "to": "1"}
+            od.maybe_update()
+            upd.assert_called_once()
+
+    def test_maybe_update_skips_dev_checkouts(self):
+        with mock.patch.dict(os.environ, {"ORCADUCHO_PLUGIN_DIR": "/x"}), mock.patch.object(od, "update_now") as upd:
+            od.maybe_update()
+            upd.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
