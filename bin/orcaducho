@@ -7,6 +7,7 @@ Stdlib only; works on macOS and Linux.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from pathlib import Path
 
 PLUGIN = "orcaducho"
 ROLES = ("coordinator", "lead", "worker")
+HOOK_ROLES = (*ROLES, "reviewer")
 DEFAULT_MODEL = {"coordinator": "opus", "lead": "sonnet", "worker": "haiku"}
 REVIEW_MODEL = {"med": "haiku", "high": "sonnet"}
 MAX_GATE_FAILURES = 2  # first failure: worker fixes; second: report failed so the coordinator escalates
@@ -26,6 +28,26 @@ DIFF_LIMIT = 60_000
 # Auto mode: a classifier approves routine actions, so unattended sessions do not stall on prompts.
 DEFAULT_CLAUDE_ARGS = ("--permission-mode", "auto")
 SKIP_PERMISSIONS_ARGS = ("--dangerously-skip-permissions",)
+# Spawned sessions skip the user's MCP connectors, skills, plugins and hooks: a bare call drops from ~25k to ~10k
+# tokens of base context, which every call of every worker pays again. orcaducho itself comes back via --plugin-dir.
+LEAN_ARGS = ("--strict-mcp-config", "--disable-slash-commands", "--setting-sources", "project,local")
+LEAN_ROLES = ("lead", "worker", "reviewer")
+
+# .orcaducho.json keys: default and allowed values (None: any string; bool: true/false; int: a number).
+SCHEMA = {
+    "check": ("", None),
+    "base": ("", None),
+    "todo": ("issues", ("issues", "markdown", "none")),
+    "depth": ("objective", ("plan", "objective", "epic-approval", "drain")),
+    "maxItems": (3, int),
+    "ship": ("pr-ready", ("pr-ready", "pr-draft", "local")),
+    "autoMerge": (False, bool),
+    "lang": ("en", ("en", "es")),
+    "autonomous": (True, bool),
+    "isolate": (True, bool),
+    "advisor": ("", None),
+}
+BACKLOG = "BACKLOG.md"
 
 
 # ---------------------------------------------------------------- helpers
@@ -90,15 +112,49 @@ def toplevel(cwd: str | None = None) -> Path:
 
 
 def config(cwd: str | None = None) -> dict:
-    cfg = {"check": "", "base": "", "issues": True, "lang": "en", "autonomous": True, "advisor": "",
-           "claudeArgs": list(DEFAULT_CLAUDE_ARGS)}
+    cfg = {k: d for k, (d, _) in SCHEMA.items()}
+    cfg["claudeArgs"] = list(DEFAULT_CLAUDE_ARGS)
     try:
         f = toplevel(cwd) / ".orcaducho.json"
         if f.exists():
-            cfg.update(json.loads(f.read_text()))
+            raw = json.loads(f.read_text())
+            if "todo" not in raw and raw.get("issues") is False:
+                raw["todo"] = "none"  # pre-0.6 configs
+            cfg.update(raw)
     except SystemExit:
         pass
+    cfg["issues"] = cfg.get("todo") == "issues"
     return cfg
+
+
+def parse_setting(item: str) -> tuple[str, object]:
+    """`key=value` from `init --set`, checked against SCHEMA."""
+    key, sep, value = item.partition("=")
+    if not sep:
+        die(f"--set expects key=value, got {item!r}")
+    if key == "claudeArgs":
+        return key, shlex.split(value)
+    if key not in SCHEMA:
+        die(f"unknown setting {key!r} (known: {', '.join(SCHEMA)}, claudeArgs)")
+    kind = SCHEMA[key][1]
+    if kind is bool:
+        if value.lower() not in ("true", "false"):
+            die(f"{key} must be true or false")
+        return key, value.lower() == "true"
+    if kind is int:
+        if not value.isdigit():
+            die(f"{key} must be a number")
+        return key, int(value)
+    if isinstance(kind, tuple) and value not in kind:
+        die(f"{key} must be one of: {', '.join(kind)}")
+    return key, value
+
+
+def common_dir(cwd: str | None = None) -> Path:
+    """orcaducho state shared by every worktree of the repo (session registry, taken backlog items)."""
+    d = Path(cwd or os.getcwd()) / git("rev-parse", "--git-common-dir", cwd=cwd) / PLUGIN  # absolute stays absolute
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def label(role: str, title: str) -> str:
@@ -110,17 +166,25 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "task"
 
 
-def plugin_dir_args() -> list[str]:
-    """ORCADUCHO_PLUGIN_DIR loads the plugin from a checkout instead of the installed copy (development)."""
-    d = os.environ.get("ORCADUCHO_PLUGIN_DIR")
+def plugin_dir_args(lean: bool = False) -> list[str]:
+    """ORCADUCHO_PLUGIN_DIR loads the plugin from a checkout instead of the installed copy (development).
+
+    Lean sessions do not read user settings, where the plugin is enabled, so they always load it by path.
+    """
+    d = os.environ.get("ORCADUCHO_PLUGIN_DIR") or (str(Path(__file__).resolve().parent.parent) if lean else "")
     return ["--plugin-dir", d] if d else []
+
+
+def lean_args(role: str, cfg: dict) -> list[str]:
+    return list(LEAN_ARGS) if role in LEAN_ROLES and cfg.get("isolate", True) else []
 
 
 def claude_argv(role: str, model: str, effort: str | None, name: str, env: dict[str, str], cfg: dict, prompt: str | None = None) -> list[str]:
     """`env K=V … claude …` as an argv list (no shell involved)."""
     env = {**env, "ORCADUCHO_MODEL": model, "ORCADUCHO_PLUGIN_DIR": os.environ.get("ORCADUCHO_PLUGIN_DIR", "")}
     argv = ["env", *(f"{k}={v}" for k, v in env.items() if v)]
-    argv += ["claude", *plugin_dir_args(), "--agent", f"{PLUGIN}:{role}", "--model", model, "-n", name]
+    lean = lean_args(role, cfg)
+    argv += ["claude", *plugin_dir_args(bool(lean)), *lean, "--agent", f"{PLUGIN}:{role}", "--model", model, "-n", name]
     if effort:
         argv += ["--effort", effort]
     if cfg.get("advisor") and role != "coordinator":
@@ -148,20 +212,48 @@ def launcher(argv: list[str], key: str) -> str:
 
 # ---------------------------------------------------------------- start
 
-def coordinator_prompt(objective: str, cfg: dict) -> str | None:
-    """The objective plus the standing authorisation an unattended run needs.
+RESUME = "Resume the orcaducho run from .orcaducho/plan.md and Orca's task state. Do not plan again."
+DEPTH = {
+    "plan": "depth=plan: after step 1 (plan), write `Status: awaiting-approval` in plan.md and stop. "
+            "A later `orcaducho start` or a user message to continue is the approval: remove that line and dispatch.",
+    "objective": "depth=objective: finish this objective with one PR, then stop.",
+    "epic-approval": "depth=epic-approval: when every task of an epic has settled, write `Status: paused` and the "
+                     "next epic in plan.md and stop. A later `orcaducho start` or a user message to continue resumes it.",
+    "drain": "depth=drain: after the PR, if every task and the review passed and fewer than {max} backlog items "
+             "were done in this chain (ORCADUCHO_DRAIN={n}), run `orcaducho backlog next`; for a non-empty result "
+             "run `orcaducho backlog take <ref>` and `orcaducho start --name orcaducho/<slug> --drain {next} --item <ref> "
+             "\"<title>\"`, then write `Status: done`.",
+}
+
+
+def run_policy(cfg: dict, drain: int = 0) -> str:
+    """The repo's run policy, stated once in the first prompt so the coordinator never reads the config."""
+    todo = {"issues": "GitHub issues", "markdown": f"{BACKLOG} (refs like E1/T3)", "none": "none (plan.md only)"}
+    depth = DEPTH.get(cfg.get("depth") or "objective", DEPTH["objective"])
+    return (f"Policy: to-do store = {todo.get(cfg.get('todo'), cfg.get('todo'))}; "
+            + depth.format(max=cfg.get("maxItems", 3), n=drain, next=drain + 1)
+            + " Ship with `orcaducho ship` (it applies the PR policy).")
+
+
+def coordinator_prompt(objective: str, cfg: dict, drain: int = 0) -> str:
+    """The objective plus the run policy and the standing authorisation an unattended run needs.
 
     Auto mode reads approvals stated in the conversation, and repos often say outward actions need a
     human request, so the user's go-ahead for the run's own branch and PR is written down once here.
     """
-    if not objective:
-        return None  # resume: the coordinator continues from .orcaducho/plan.md
+    text = objective or RESUME
+    policy = run_policy(cfg, drain)
     if not cfg.get("autonomous", True):
-        return objective
+        return f"{text}\n\n({policy})"
     base = cfg.get("base") or "the configured base branch"
-    return (f"{objective}\n\n(orcaducho run, unattended: nobody answers questions or permission prompts. "
-            f"You are authorised to create the planned issues, push the run branch and its child branches, "
-            f"and open one PR against {base}. Decide product questions yourself as described in your instructions.)")
+    ship = cfg.get("ship") or "pr-ready"
+    outward = ("Keep the run branch local: do not push it or open a PR." if ship == "local" else
+               f"You are authorised to push the run branch and its child branches and open one "
+               f"{'draft ' if ship == 'pr-draft' else ''}PR against {base}"
+               + (", with auto-merge enabled." if cfg.get("autoMerge") else "."))
+    issues = "You may create the planned issues. " if cfg.get("todo") == "issues" else ""
+    return (f"{text}\n\n(orcaducho run, unattended: nobody answers questions or permission prompts. {issues}{outward} "
+            f"Decide product questions yourself as described in your instructions. {policy})")
 
 
 def cmd_start(a: argparse.Namespace) -> None:
@@ -171,8 +263,10 @@ def cmd_start(a: argparse.Namespace) -> None:
     cfg = config()
     if a.base:
         cfg["base"] = a.base
-    prompt = coordinator_prompt(objective, cfg)
-    env = {"ORCADUCHO_ROLE": "coordinator"}
+    prompt = coordinator_prompt(objective, cfg, a.drain)
+    if a.item:
+        prompt += f"\n\nThis objective is backlog item {a.item}; `orcaducho ship` closes it."
+    env = {"ORCADUCHO_ROLE": "coordinator", "ORCADUCHO_DRAIN": str(a.drain), "ORCADUCHO_ITEM": a.item or ""}
     if not a.name:
         if not os.environ.get("ORCA_TERMINAL_HANDLE"):
             die("run inside an Orca terminal, or pass --name to create a new worktree for the run")
@@ -429,7 +523,62 @@ def render_result(role: str, outcome: str, subject: str, body: str, model: str, 
     return "\n\n".join(out)
 
 
+PATH_RE = re.compile(r"[\w.-]+/[\w./-]+|[\w-]+\.\w{1,5}\b")
+
+
+def warn_unnamed_target(spec: str) -> None:
+    """A spec that names the file (and symbol) gets right answers far more often than a vague one."""
+    target = parse_spec(spec)[1].get("Target", "")
+    if not PATH_RE.search(target):
+        print("orcaducho: Target names no file; write it as path::symbol so the worker opens the right code",
+              file=sys.stderr)
+
+
+def git_commit_file(root: Path, name: str, message: str) -> None:
+    run(["git", "add", name], cwd=str(root))
+    run(["git", "commit", "-q", "-m", message, "--", name], cwd=str(root), check=False)
+
+
+def backlog_file(root: Path) -> Path:
+    f = root / BACKLOG
+    if not f.exists():
+        f.write_text("# Backlog\n\n## Todo\n\n## Runs\n")
+    return f
+
+
+def markdown_issue(a: argparse.Namespace) -> str:
+    """Record an epic or task in BACKLOG.md instead of GitHub; returns its ref (E1, T3)."""
+    root = toplevel()
+    f = backlog_file(root)
+    body = f.read_text()
+    prefix = "E" if a.kind == "epic" else "T"
+    used = [int(n) for n in re.findall(rf"\b{prefix}(\d+) ·", body)]
+    ref = f"{prefix}{max(used or [0]) + 1}"
+    if a.kind == "epic":
+        goal = f"\n{a.goal.strip()}\n" if a.goal else ""
+        body = body.rstrip("\n") + f"\n\n### {ref} · {a.title}\n{goal}"
+    else:
+        target = parse_spec(a.body or "")[1].get("Target", "").splitlines()
+        line = f"- [ ] {ref} · {a.title} · risk {a.risk}" + (f" · {target[0].strip()}" if target else "")
+        head = re.search(rf"^### {re.escape(a.parent or '')} · .*$", body, re.MULTILINE) if a.parent else None
+        if head:
+            nxt = re.search(r"^#{2,3} ", body[head.end():], re.MULTILINE)
+            at = head.end() + nxt.start() if nxt else len(body)
+            body = body[:at].rstrip("\n") + f"\n{line}\n" + ("\n" + body[at:] if nxt else "")
+        else:
+            body = body.rstrip("\n") + f"\n{line}\n"
+    f.write_text(body.rstrip("\n") + "\n")
+    git_commit_file(root, BACKLOG, f"backlog: {ref} {a.title}"[:72])
+    return ref
+
+
 def cmd_issue(a: argparse.Namespace) -> None:
+    if a.kind == "task":
+        warn_unnamed_target(a.body or "")
+    todo = config().get("todo")
+    if todo == "markdown" and os.environ.get("ORCADUCHO_ROLE") != "lead":
+        print(markdown_issue(a))  # a lead's child tasks live in Orca only, so two branches never edit BACKLOG.md
+        return
     if not issues_enabled():
         print("-")  # issues off: callers treat "-" as "no issue"
         return
@@ -451,6 +600,26 @@ def cmd_issue(a: argparse.Namespace) -> None:
     print(number)
 
 
+def cmd_done(a: argparse.Namespace) -> None:
+    """Mark a task's record finished: tick it in BACKLOG.md, or label a failed GitHub issue."""
+    ref = a.ref.lstrip("#")
+    if ref.isdigit():
+        if a.failed and issues_enabled():
+            run(["gh", "issue", "edit", ref, "--add-label", "status:failed"], check=False)
+        print(json.dumps({"ref": a.ref, "failed": a.failed}))
+        return
+    if ref == "-":
+        return
+    root = toplevel()
+    f = root / BACKLOG
+    body = f.read_text() if f.exists() else ""
+    new = re.sub(rf"^(\s*- )\[ \]( {re.escape(ref)} ·)", rf"\g<1>[{'!' if a.failed else 'x'}]\2", body, flags=re.MULTILINE)
+    if new != body:
+        f.write_text(new)
+        git_commit_file(root, BACKLOG, f"backlog: {ref} {'failed' if a.failed else 'done'}")
+    print(json.dumps({"ref": a.ref, "failed": a.failed, "updated": new != body}))
+
+
 def cmd_refresh(a: argparse.Namespace) -> None:
     """Re-render raw-spec issues written by orcaducho < 0.4 (risk from labels, parent from the sub-issue link)."""
     if not issues_enabled():
@@ -469,6 +638,218 @@ def cmd_refresh(a: argparse.Namespace) -> None:
         if new != body:
             run(["gh", "issue", "edit", n, "--body", new])
         print(json.dumps({"issue": n, "refreshed": new != body}))
+
+
+# ---------------------------------------------------------------- backlog (depth=drain)
+
+TODO_RE = re.compile(r"^\s*- \[ \] (.+)$", re.MULTILINE)
+
+
+def taken_refs() -> set[str]:
+    try:
+        return set(json.loads((common_dir() / "taken.json").read_text()))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def todo_items(body: str) -> list[tuple[str, str]]:
+    """Open items under `## Todo` in BACKLOG.md as (ref, text); the ref is a hash, so editing text makes a new item."""
+    m = re.search(r"^## Todo\s*$(.*?)(?=^## |\Z)", body, re.MULTILINE | re.DOTALL)
+    return [("todo:" + hashlib.sha1(t.strip().encode()).hexdigest()[:8], t.strip())
+            for t in TODO_RE.findall(m.group(1) if m else "")]
+
+
+def cmd_backlog(a: argparse.Namespace) -> None:
+    cfg = config()
+    todo = cfg.get("todo")
+    if todo == "none":
+        die("todo is none: there is no backlog to drain (orcaducho init --set todo=issues|markdown)")
+    if a.action in ("add", "take") and not a.ref:
+        die(f"backlog {a.action} needs an argument")
+    if a.action == "add":
+        if todo == "issues":
+            run(["gh", "label", "create", "backlog", "--color", "c5def5", "--force"], check=False)
+            print(run(["gh", "issue", "create", "--title", a.ref, "--body", "", "--label", "backlog"]).stdout.strip())
+        else:
+            f = backlog_file(toplevel())
+            body = f.read_text()
+            m = re.search(r"^## Todo\s*$\n?", body, re.MULTILINE)
+            at = m.end() if m else len(body)
+            items = list(re.finditer(r"^\s*- \[.\] .+$", body[at:].split("\n## ", 1)[0], re.MULTILINE))
+            at += items[-1].end() + 1 if items else 0
+            f.write_text(body[:at] + f"- [ ] {a.ref}\n" + body[at:])
+            print(json.dumps({"added": a.ref}))
+        return
+    taken = taken_refs()
+    if a.action == "next":
+        if todo == "issues":
+            rows = json.loads(run(["gh", "issue", "list", "--label", "backlog", "--state", "open", "-L", "100",
+                                   "--json", "number,title,body"]).stdout or "[]")
+            items = [(f"#{r['number']}", r["title"], r.get("body") or "") for r in sorted(rows, key=lambda r: r["number"])]
+        else:
+            f = toplevel() / BACKLOG
+            items = [(ref, t, "") for ref, t in todo_items(f.read_text() if f.exists() else "")]
+        nxt = next((i for i in items if i[0] not in taken), None)
+        print(json.dumps({"ref": nxt[0], "title": nxt[1], "body": nxt[2][:2000]}) if nxt else "")
+        return
+    if a.action == "take":
+        (common_dir() / "taken.json").write_text(json.dumps(sorted(taken | {a.ref})))
+        if a.ref.startswith("#") and todo == "issues":
+            run(["gh", "issue", "edit", a.ref[1:], "--remove-label", "backlog", "--add-label", "orcaducho"], check=False)
+        print(json.dumps({"taken": a.ref}))
+
+
+# ---------------------------------------------------------------- ship
+
+def cmd_ship(a: argparse.Namespace) -> None:
+    """Deliver the run branch as the repo's policy says: local branch, draft PR or ready PR, optionally auto-merged."""
+    cfg = config()
+    root = toplevel()
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    item, body = os.environ.get("ORCADUCHO_ITEM", ""), a.body or ""
+    if item.startswith("todo:"):
+        f = root / BACKLOG
+        text = dict(todo_items(f.read_text() if f.exists() else "")).get(item)
+        if text:
+            f.write_text(re.sub(rf"^(\s*- )\[ \] {re.escape(text)}$", rf"\g<1>[x] {text}", f.read_text(),
+                                count=1, flags=re.MULTILINE))
+            git_commit_file(root, BACKLOG, f"backlog: done {text}"[:72])
+    elif item.startswith("#"):
+        body += f"\n\nCloses {item}"
+    out = {"branch": branch, "ship": cfg.get("ship")}
+    if cfg.get("ship") == "local":
+        print(json.dumps({**out, "pushed": False}))
+        return
+    run(["git", "push", "-u", "origin", branch])
+    draft = cfg.get("ship") == "pr-draft"
+    pr = ["gh", "pr", "create", "--head", branch, "--title", a.title, "--body", body]
+    if cfg.get("base"):
+        pr += ["--base", cfg["base"]]
+    url = run(pr + (["--draft"] if draft else [])).stdout.strip().splitlines()[-1]
+    out.update(pushed=True, pr=url, autoMerge=False)
+    if cfg.get("autoMerge") and not draft:  # GitHub does not auto-merge drafts
+        out["autoMerge"] = run(["gh", "pr", "merge", url, "--auto", "--squash"], check=False).returncode == 0
+    print(json.dumps(out))
+
+
+# ---------------------------------------------------------------- cost
+
+USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+
+
+def transcript_usage(path: Path) -> dict[str, dict[str, int]]:
+    """Tokens per model in one transcript and its subagents', counting each API message once."""
+    totals: dict[str, dict[str, int]] = {}
+    seen: set[str] = set()
+    sub = path.with_suffix("") / "subagents"
+    for f in [path, *(sorted(sub.glob("*.jsonl")) if sub.is_dir() else [])]:
+        try:
+            lines = f.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = row.get("message") if isinstance(row, dict) and row.get("type") == "assistant" else None
+            if not isinstance(msg, dict) or not msg.get("usage") or msg.get("id") in seen:
+                continue
+            seen.add(msg.get("id"))
+            t = totals.setdefault(msg.get("model") or "?", dict.fromkeys(USAGE_KEYS, 0))
+            for k in USAGE_KEYS:
+                t[k] += int(msg["usage"].get(k) or 0)
+    return totals
+
+
+def cmd_cost(a: argparse.Namespace) -> None:
+    """Token usage of orcaducho sessions in this repo, by role and model (from the transcripts)."""
+    since = time.time() - a.hours * 3600 if a.hours else 0
+    sessions: dict[str, dict] = {}
+    try:
+        for line in (common_dir() / "sessions.jsonl").read_text().splitlines():
+            row = json.loads(line)
+            if row.get("ts", 0) >= since:
+                sessions.setdefault(row["transcript"], row)
+    except (OSError, json.JSONDecodeError):
+        pass
+    table: dict[tuple[str, str], dict[str, int]] = {}
+    for path, row in sessions.items():
+        for model, t in transcript_usage(Path(path)).items():
+            cell = table.setdefault((row.get("role") or "?", model), {"sessions": 0, **dict.fromkeys(USAGE_KEYS, 0)})
+            cell["sessions"] += 1
+            for k in USAGE_KEYS:
+                cell[k] += t[k]
+    rows = [{"role": r, "model": m, **c, "total": sum(c[k] for k in USAGE_KEYS)} for (r, m), c in sorted(table.items())]
+    if a.json:
+        print(json.dumps(rows))
+        return
+    if not rows:
+        print("no orcaducho sessions recorded yet")
+        return
+    head = ("role", "model", "sessions", "input", "cache write", "cache read", "output", "total")
+    cells = [[r["role"], r["model"], r["sessions"], *(r[k] for k in USAGE_KEYS), r["total"]] for r in rows]
+    cells.append(["all", "", sum(r["sessions"] for r in rows), *(sum(r[k] for r in rows) for k in USAGE_KEYS),
+                  sum(r["total"] for r in rows)])
+    fmt = [lambda v: str(v)] * 3 + [lambda v: f"{v:,}"] * 5
+    text_rows = [list(head)] + [[f(v) for f, v in zip(fmt, c)] for c in cells]
+    widths = [max(len(r[i]) for r in text_rows) for i in range(len(head))]
+    for r in text_rows:
+        print("  ".join(v.ljust(w) if i < 2 else v.rjust(w) for i, (v, w) in enumerate(zip(r, widths))))
+
+
+# ---------------------------------------------------------------- audit
+
+def base_tokens(extra: list[str], cwd: str) -> int | None:
+    """Tokens a bare "ok" costs on Haiku: the base context every call of a session pays again."""
+    try:
+        p = subprocess.run(["claude", "-p", "--model", "haiku", *extra, "--output-format", "json", "ok"],
+                           cwd=cwd, capture_output=True, text=True, timeout=180)
+        usage = json.loads(p.stdout).get("modelUsage") or {}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    return sum(u.get(k, 0) for u in usage.values() for k in ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"))
+
+
+def cmd_audit(a: argparse.Namespace) -> None:
+    """Report (never edit) what inflates the base context of every Claude session on this machine and in this repo."""
+    home, root = claude_dir(), toplevel()
+
+    def size(f: Path) -> int:
+        return f.stat().st_size if f.is_file() else 0
+
+    def read_json(f: Path) -> dict:
+        try:
+            return json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+    settings, state = read_json(home / "settings.json"), read_json(Path.home() / ".claude.json")
+    mcp = list((state.get("mcpServers") or {})) + list(((state.get("projects") or {}).get(str(root)) or {}).get("mcpServers") or {})
+    facts = {
+        "userClaudeMdBytes": size(home / "CLAUDE.md"),
+        "projectClaudeMdBytes": size(root / "CLAUDE.md") + size(root / ".claude" / "CLAUDE.md"),
+        "userSkills": len([d for d in (home / "skills").glob("*/SKILL.md")]),
+        "enabledPlugins": [k for k, v in (settings.get("enabledPlugins") or {}).items() if v],
+        "localMcpServers": mcp,
+    }
+    tips = []
+    if facts["userClaudeMdBytes"] > 4000:
+        tips.append("~/.claude/CLAUDE.md is over 4 KB and loads into every call of every session: move long rules into skills.")
+    if facts["projectClaudeMdBytes"] > 4000:
+        tips.append("The project CLAUDE.md is over 4 KB: keep a short repo guide and move the rest into skills or .claude/rules/.")
+    if len(facts["enabledPlugins"]) > 8:
+        tips.append("Many plugins are enabled; their skills and hooks join every session. Disable the ones you rarely use.")
+    if len(mcp) > 3:
+        tips.append("Several MCP servers are configured; turn off the ones you do not use, or prefer CLIs like gh.")
+    if a.measure and shutil.which("claude"):
+        facts["baseTokens"] = {"default": base_tokens([], str(root)),
+                               "lean": base_tokens(["--strict-mcp-config", "--disable-slash-commands"], str(root))}
+        full, lean = facts["baseTokens"]["default"], facts["baseTokens"]["lean"]
+        if full and lean and full - lean > 5000:
+            tips.append(f"Your skills and MCP connectors add {full - lean:,} tokens to every call of every interactive "
+                        f"session ({full:,} vs {lean:,}). orcaducho workers already skip them (isolate); for your own "
+                        f"sessions, disable what you rarely use.")
+    print(json.dumps({"facts": facts, "suggestions": tips}, indent=2))
 
 
 # ---------------------------------------------------------------- hooks
@@ -589,7 +970,9 @@ def review(diff: str, model: str, what: str, cwd: str | None = None) -> str:
     prompt = f"Review this diff for {what}. Answer per your instructions.\n\n```diff\n{diff}\n```"
     env = {**os.environ, "ORCADUCHO_ROLE": "reviewer"}
     try:
-        p = subprocess.run(["claude", "-p", *plugin_dir_args(), "--agent", f"{PLUGIN}:reviewer", "--model", model, prompt],
+        lean = lean_args("reviewer", config(cwd))
+        p = subprocess.run(["claude", "-p", *plugin_dir_args(bool(lean)), *lean, "--agent", f"{PLUGIN}:reviewer",
+                            "--model", model, prompt],
                            cwd=cwd, capture_output=True, text=True, timeout=600, env=env)
     except subprocess.TimeoutExpired:
         return "PASS"  # a stuck reviewer must not block delivery; checks already passed
@@ -629,17 +1012,55 @@ def hook_permission(event: dict) -> None:
                                              "decision": {"behavior": "deny", "message": message}}}))
 
 
+CHECKPOINT_RE = re.compile(r"^\s*checkpoint:\s*wave\b.*\n?", re.IGNORECASE | re.MULTILINE)
+
+
+def plan_file(cwd: str | None) -> Path:
+    return toplevel(cwd) / ".orcaducho" / "plan.md"
+
+
 def run_finished(cwd: str | None) -> bool:
-    plan = toplevel(cwd) / ".orcaducho" / "plan.md"
+    """done/stopped end the run; awaiting-approval/paused wait for the user (depth plan / epic-approval)."""
     try:
-        return bool(re.search(r"^\s*status:\s*(done|stopped)\b", plan.read_text(), re.IGNORECASE | re.MULTILINE))
+        return bool(re.search(r"^\s*status:\s*(done|stopped|awaiting-approval|paused)\b", plan_file(cwd).read_text(),
+                              re.IGNORECASE | re.MULTILINE))
     except OSError:
         return False
 
 
+def take_checkpoint(cwd: str | None) -> bool:
+    """Remove a `Checkpoint: wave` line from plan.md; True if there was one."""
+    f = plan_file(cwd)
+    try:
+        body = f.read_text()
+    except OSError:
+        return False
+    new = CHECKPOINT_RE.sub("", body)
+    if new == body:
+        return False
+    f.write_text(new)
+    return True
+
+
+def detach(cmd: list[str], cwd: str | None) -> None:
+    """Run cmd in the background, outliving the hook that started it."""
+    subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def hook_stop(event: dict) -> None:
-    """Keep the coordinator looping until plan.md says the run is done (Claude Code caps consecutive continuations)."""
-    if os.environ.get("ORCADUCHO_ROLE") != "coordinator" or not autonomous(event) or run_finished(event.get("cwd")):
+    """Keep the coordinator looping until plan.md says the run is done (Claude Code caps consecutive continuations).
+
+    At a `Checkpoint: wave` it lets the turn end and restarts the conversation instead: /clear plus a resume
+    prompt typed into its own Orca terminal, so later waves stop paying for the history of earlier ones.
+    """
+    if os.environ.get("ORCADUCHO_ROLE") != "coordinator":
+        return
+    cwd = event.get("cwd")
+    handle = os.environ.get("ORCA_TERMINAL_HANDLE")
+    if take_checkpoint(cwd) and handle:
+        detach([sys.executable, str(Path(__file__).resolve()), "rotate", "--terminal", handle], cwd)
+        return
+    if not autonomous(event) or run_finished(cwd):
         return
     if event.get("background_tasks"):
         return  # background work will wake the session on its own
@@ -649,12 +1070,37 @@ def hook_stop(event: dict) -> None:
         "if the run cannot continue at all, add `Status: stopped` with one line saying why.")}}))
 
 
+def cmd_rotate(a: argparse.Namespace) -> None:
+    """Restart the coordinator's conversation in place: wait for its turn to end, then /clear and resume."""
+    wait = ("terminal", "wait", "--terminal", a.terminal, "--for", "tui-idle", "--timeout-ms", "120000")
+    orca(*wait, check=False)
+    orca("terminal", "send", "--terminal", a.terminal, "--text", "/clear", "--enter", check=False)
+    time.sleep(2)
+    orca(*wait, check=False)
+    prompt = coordinator_prompt("", config(), int(os.environ.get("ORCADUCHO_DRAIN") or 0))
+    orca("terminal", "send", "--terminal", a.terminal, "--text", prompt, "--enter", check=False)
+
+
+def hook_session(event: dict) -> None:
+    """Record every orcaducho session (also after /clear) so `orcaducho cost` can find its transcript."""
+    if not event.get("transcript_path"):
+        return
+    row = {"ts": int(time.time()), "session": event.get("session_id"), "transcript": event["transcript_path"],
+           "role": os.environ.get("ORCADUCHO_ROLE"), "model": os.environ.get("ORCADUCHO_MODEL", ""),
+           "task": os.environ.get("ORCADUCHO_TASK", ""), "source": event.get("source", "")}
+    try:
+        with (common_dir(event.get("cwd")) / "sessions.jsonl").open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except (OSError, SystemExit):
+        pass
+
+
 def hook_post(event: dict) -> None:
     """After worker_done: mirror the summary onto the task's GitHub issue (no model tokens)."""
     issue = os.environ.get("ORCADUCHO_ISSUE")
     command = (event.get("tool_input") or {}).get("command", "")
-    if not issue or issue == "-" or not is_worker_done(command) or not shutil.which("gh"):
-        return
+    if not issue or not issue.isdigit() or not is_worker_done(command) or not shutil.which("gh"):
+        return  # "-", or a BACKLOG.md ref: nothing to comment on
     try:
         argv = shlex.split(command)
     except ValueError:
@@ -670,14 +1116,15 @@ def hook_post(event: dict) -> None:
 
 
 def cmd_hook(a: argparse.Namespace) -> None:
-    if os.environ.get("ORCADUCHO_ROLE") not in ROLES:
+    role = os.environ.get("ORCADUCHO_ROLE")
+    if role not in HOOK_ROLES or (role == "reviewer" and a.which != "session"):
         return  # inert outside orcaducho sessions
     try:
         event = json.load(sys.stdin)
     except json.JSONDecodeError:
         return
     {"guard": hook_guard, "gate": hook_gate, "post": hook_post, "ask": hook_ask,
-     "permission": hook_permission, "stop": hook_stop}[a.which](event)
+     "permission": hook_permission, "stop": hook_stop, "session": hook_session}[a.which](event)
 
 
 # ---------------------------------------------------------------- init
@@ -702,24 +1149,75 @@ def detect_check(root: Path) -> str:
     return ""
 
 
-def cmd_init(a: argparse.Namespace) -> None:
-    """Write .orcaducho.json in the repo root and keep .orcaducho/ out of git (locally)."""
-    root = toplevel()
+def write_config(root: Path, cfg: dict) -> Path:
     f = root / ".orcaducho.json"
-    if f.exists() and not a.force:
-        die(f"{f} already exists (use --force to overwrite)")
-    base = a.base or git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False).removeprefix("origin/")
-    cfg = {"check": a.check if a.check is not None else detect_check(root), "base": base, "issues": not a.no_issues,
-           "lang": a.lang, "autonomous": not a.supervised, "advisor": a.advisor or "",
-           "claudeArgs": list(SKIP_PERMISSIONS_ARGS if a.skip_permissions else DEFAULT_CLAUDE_ARGS)}
+    cfg = {k: v for k, v in cfg.items() if k != "issues"}  # derived from todo
     f.write_text(json.dumps(cfg, indent=2) + "\n")
-    exclude = Path(git("rev-parse", "--git-path", "info/exclude"))
+    exclude = Path(git("rev-parse", "--git-path", "info/exclude", cwd=str(root)))
     exclude = exclude if exclude.is_absolute() else root / exclude
     exclude.parent.mkdir(parents=True, exist_ok=True)
     if ".orcaducho/" not in (exclude.read_text() if exclude.exists() else ""):
         with exclude.open("a") as fh:
             fh.write("\n.orcaducho/\n")
-    print(json.dumps({"config": str(f), **cfg}))
+    return f
+
+
+def detected(root: Path) -> dict:
+    """Defaults orcaducho can work out on its own, plus what the project already has for Claude."""
+    claude = root / ".claude"
+
+    def size(f: Path) -> int:
+        return f.stat().st_size if f.is_file() else 0
+    return {
+        "check": detect_check(root),
+        "base": git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False).removeprefix("origin/"),
+        "gh": bool(shutil.which("gh")) and issues_enabled(),
+        "config": json.loads((root / ".orcaducho.json").read_text()) if (root / ".orcaducho.json").exists() else None,
+        "claudeMdBytes": size(root / "CLAUDE.md") + size(claude / "CLAUDE.md"),
+        "skills": sorted(d.parent.name for d in claude.glob("skills/*/SKILL.md")),
+        "rules": sorted(f.name for f in claude.glob("rules/*.md")),
+        "settings": (claude / "settings.json").exists(),
+        "backlog": (root / BACKLOG).exists(),
+    }
+
+
+INIT_FLAGS = ("check", "base", "lang", "advisor", "todo", "depth", "max_items", "ship")
+
+
+def cmd_init(a: argparse.Namespace) -> None:
+    """Set the repo up for orcaducho: an interactive setup agent in a terminal, or flags/--set for scripts."""
+    root = toplevel()
+    f = root / ".orcaducho.json"
+    if a.detect:
+        print(json.dumps(detected(root), indent=2))
+        return
+    if a.set:
+        cfg = config()
+        cfg.update(parse_setting(item) for item in a.set)
+        if cfg.get("depth") == "drain" and cfg.get("todo") == "none":
+            die("depth=drain needs a backlog: set todo to issues or markdown")
+        print(json.dumps({"config": str(write_config(root, cfg)), **{k: v for k, v in cfg.items() if k != "issues"}}))
+        return
+    flagged = any(getattr(a, k) is not None for k in INIT_FLAGS) or a.no_issues or a.supervised or \
+        a.skip_permissions or a.auto_merge or a.no_isolate
+    if not (a.yes or flagged) and sys.stdin.isatty() and sys.stdout.isatty() and shutil.which("claude"):
+        prompt = ("Set up this repository for orcaducho and agentic development. orcaducho detected:\n"
+                  + json.dumps(detected(root), indent=2))
+        argv = ["claude", *plugin_dir_args(), "--agent", f"{PLUGIN}:setup", "--model", "sonnet",
+                "-n", f"{PLUGIN}:setup", prompt]
+        os.execvp(argv[0], argv)
+    if f.exists() and not a.force:
+        die(f"{f} already exists (use --force to overwrite, or --set key=value to change one setting)")
+    todo = a.todo or ("none" if a.no_issues else "issues")
+    cfg = {"check": a.check if a.check is not None else detect_check(root),
+           "base": a.base or detected(root)["base"], "todo": todo, "depth": a.depth or "objective",
+           "maxItems": a.max_items or 3, "ship": a.ship or "pr-ready", "autoMerge": a.auto_merge,
+           "lang": a.lang or "en", "autonomous": not a.supervised, "isolate": not a.no_isolate,
+           "advisor": a.advisor or "",
+           "claudeArgs": list(SKIP_PERMISSIONS_ARGS if a.skip_permissions else DEFAULT_CLAUDE_ARGS)}
+    if cfg["depth"] == "drain" and todo == "none":
+        die("--depth drain needs a backlog: use --todo issues or markdown")
+    print(json.dumps({"config": str(write_config(root, cfg)), **cfg}))
     if not cfg["check"]:
         print("orcaducho: no check command found; pass --check, or the coordinator fills it in on first run", file=sys.stderr)
 
@@ -821,6 +1319,8 @@ def main() -> None:
     s.add_argument("--base", help="base branch for --name (default: config base, else repo default)")
     s.add_argument("--model", default=DEFAULT_MODEL["coordinator"])
     s.add_argument("--effort", default=None)
+    s.add_argument("--drain", type=int, default=0, help=argparse.SUPPRESS)  # depth=drain: items done in this chain
+    s.add_argument("--item", help="the backlog item (ref from `backlog next`) this run works on")
     s.set_defaults(fn=cmd_start)
 
     s = sub.add_parser("spawn", help="start a named, supervised lead/worker for an Orca Task")
@@ -860,25 +1360,62 @@ def main() -> None:
     s.add_argument("--risk", choices=("low", "med", "high"), default="low")
     s.set_defaults(fn=cmd_issue)
 
+    s = sub.add_parser("done", help="mark a task record finished (BACKLOG.md tick, or status:failed on its issue)")
+    s.add_argument("ref", help="issue number, BACKLOG.md ref (T3), or -")
+    s.add_argument("--failed", action="store_true")
+    s.set_defaults(fn=cmd_done)
+
+    s = sub.add_parser("backlog", help="the queue depth=drain works through: next, take <ref>, add <text>")
+    s.add_argument("action", choices=("next", "take", "add"))
+    s.add_argument("ref", nargs="?", help="take: the ref printed by next; add: the objective text")
+    s.set_defaults(fn=cmd_backlog)
+
+    s = sub.add_parser("ship", help="push and open the PR (or keep it local) as the repo's ship policy says")
+    s.add_argument("--title", required=True)
+    s.add_argument("--body", default="")
+    s.set_defaults(fn=cmd_ship)
+
+    s = sub.add_parser("cost", help="token usage of this repo's orcaducho sessions, by role and model")
+    s.add_argument("--hours", type=float, help="only sessions started in the last N hours")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_cost)
+
+    s = sub.add_parser("audit", help="report what inflates every session's base context (edits nothing)")
+    s.add_argument("--measure", action="store_true", help="also measure a bare call, default vs lean (two Haiku calls)")
+    s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser("rotate", help="internal: restart the coordinator's conversation at a wave checkpoint")
+    s.add_argument("--terminal", required=True)
+    s.set_defaults(fn=cmd_rotate)
+
     s = sub.add_parser("refresh", help="re-render task issues written as raw specs (orcaducho < 0.4)")
     s.add_argument("numbers", nargs="+")
     s.set_defaults(fn=cmd_refresh)
 
     s = sub.add_parser("hook", help="Claude Code hook entry point")
-    s.add_argument("which", choices=("guard", "gate", "post", "ask", "permission", "stop"))
+    s.add_argument("which", choices=("guard", "gate", "post", "ask", "permission", "stop", "session"))
     s.set_defaults(fn=cmd_hook)
 
-    s = sub.add_parser("init", help="set up the current repo (.orcaducho.json, local ignore)")
+    s = sub.add_parser("init", help="set up the current repo: interactive setup agent, or flags/--set for scripts")
     s.add_argument("--check", help="verification command (default: detected from package.json, Cargo.toml, go.mod, pyproject.toml)")
     s.add_argument("--base", help="base branch (default: origin's default branch)")
     s.add_argument("--no-issues", action="store_true", help="do not use GitHub issues")
     s.add_argument("--skip-permissions", action="store_true",
                    help="run agents with --dangerously-skip-permissions instead of auto mode (containers/VMs only)")
-    s.add_argument("--lang", default="en", help="language of the issues orcaducho writes: en or es (default en)")
+    s.add_argument("--lang", choices=("en", "es"), help="language of the issues orcaducho writes (default en)")
+    s.add_argument("--todo", choices=SCHEMA["todo"][1], help="where tasks are recorded (default issues)")
+    s.add_argument("--depth", choices=SCHEMA["depth"][1], help="how far a run goes (default objective)")
+    s.add_argument("--max-items", type=int, help="depth drain: backlog items per chain (default 3)")
+    s.add_argument("--ship", choices=SCHEMA["ship"][1], help="how a run is delivered (default pr-ready)")
+    s.add_argument("--auto-merge", action="store_true", help="enable auto-merge on the run's PR")
+    s.add_argument("--no-isolate", action="store_true", help="give workers your user skills, MCP servers and plugins")
     s.add_argument("--advisor", help="advisor model for leads and workers, e.g. opus (Anthropic API only)")
     s.add_argument("--supervised", action="store_true",
                    help="let agents ask you questions and permission prompts (default: fully autonomous)")
     s.add_argument("--force", action="store_true")
+    s.add_argument("--yes", action="store_true", help="write defaults without the interactive setup agent")
+    s.add_argument("--set", action="append", metavar="KEY=VALUE", help="change one setting (repeatable)")
+    s.add_argument("--detect", action="store_true", help="print detected defaults and the project's Claude setup")
     s.set_defaults(fn=cmd_init)
 
     s = sub.add_parser("update", help="update the plugin and CLI now, and turn on background auto-update")

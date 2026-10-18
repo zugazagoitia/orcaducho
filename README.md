@@ -84,25 +84,50 @@ curl -fsSL https://raw.githubusercontent.com/zugazagoitia/orcaducho/main/install
 
 3. Restart Claude Code, then check that everything is visible:
    - `orcaducho --help` works in a shell.
-   - `/agents` in Claude Code lists `orcaducho:coordinator`, `:lead`, `:worker` and `:reviewer`.
+   - `/agents` in Claude Code lists `orcaducho:coordinator`, `:lead`, `:worker`, `:reviewer` and `:setup`.
 
 ## Set up a project
 
 In each repository, run:
 
 ```sh
-orcaducho init [--check "<cmd>"] [--base develop] [--lang es] [--advisor opus] [--skip-permissions] [--supervised] [--no-issues]
+orcaducho init
 ```
 
-This writes `.orcaducho.json` and adds `.orcaducho/` to the repo's local git exclude list. `--check` is detected from `package.json` scripts (`typecheck`, `lint`, `test`, with the package manager taken from the lockfile), `Cargo.toml`, `go.mod` or `pyproject.toml`; `--base` defaults to origin's default branch. You can also write the file by hand; if it is missing, the coordinator runs `orcaducho init` itself.
+In a terminal, this starts the **setup agent** (`orcaducho:setup`, Sonnet). It explores the repo, then interviews you, then shows every change it wants to make and waits for your approval:
+
+1. **Run policy:** where tasks are recorded, how far a run goes, how it is delivered, autonomy, `check`, `base` and language (see the table below).
+2. **Claude setup**, each item shown as full content or a diff with a one-line reason:
+   - a short `CLAUDE.md` (about 1 KB), with long rules moved into skills
+   - project skills for the workflows it finds
+   - path-scoped `.claude/rules/`
+   - `.claude/settings.json` (an allowlist for your check commands, deny rules for vendored and build folders)
+3. **Machine report:** `orcaducho audit --measure` shows how many tokens your own skills, plugins and MCP servers add to every call. It never edits `~/.claude`.
+4. **Delivery:** the approved files and `.orcaducho.json` are committed on `orcaducho/setup` and delivered as your ship policy says. The setup PR is never auto-merged.
+
+For scripts, CI, or the coordinator (which runs `init` itself when `.orcaducho.json` is missing), use flags or settings instead. Without a terminal, `init` writes defaults:
+
+```sh
+orcaducho init --yes                                   # detected defaults, no agent
+orcaducho init --todo markdown --depth plan --ship pr-draft --check "make test"
+orcaducho init --set autoMerge=true --set depth=drain  # change single settings (validated)
+orcaducho init --detect                                # what orcaducho detects, as JSON
+```
+
+`--check` is detected from `package.json` scripts (`typecheck`, `lint`, `test`, with the package manager taken from the lockfile), `Cargo.toml`, `go.mod` or `pyproject.toml`; `--base` defaults to origin's default branch. `init` also adds `.orcaducho/` to the repo's local git exclude list.
 
 ```json
 {
   "check": "pnpm typecheck && pnpm lint && pnpm test",
   "base": "develop",
-  "issues": true,
+  "todo": "issues",
+  "depth": "objective",
+  "maxItems": 3,
+  "ship": "pr-ready",
+  "autoMerge": false,
   "lang": "es",
   "autonomous": true,
+  "isolate": true,
   "advisor": "",
   "claudeArgs": ["--permission-mode", "auto"]
 }
@@ -110,11 +135,22 @@ This writes `.orcaducho.json` and adds `.orcaducho/` to the repo's local git exc
 
 - **`check`:** your fast verification command. It runs before any worker can report success.
 - **`base`:** the branch the run starts from and the final PR targets.
-- **Autonomy:** runs are unattended by default (see [Autonomy](#autonomy)). Every session starts in auto mode, where a classifier approves routine actions. `--skip-permissions` uses `--dangerously-skip-permissions` instead; use it only in a container or VM. `--supervised` (`"autonomous": false`) turns the autonomy hooks off, so agents may ask you questions and wait at permission prompts.
-- **`advisor`:** an advisor model (e.g. `opus`) passed as `--advisor` to leads and workers, so a Haiku worker can consult Opus at decision points instead of failing and being retried. Experimental, Anthropic API only; an unsupported pairing makes `claude` exit at launch.
-- **Issues:** with `gh` logged in and Issues enabled on the repo, orcaducho creates the labels `orcaducho`, `risk:low|med|high` and `status:failed` automatically. `lang` (`en` or `es`) is the language of the issue headings and comments. Set `"issues": false` to skip GitHub entirely.
+- **`todo`:** where the plan is recorded.
+  - `issues`: a GitHub epic with sub-issues. With `gh` logged in, orcaducho creates its labels automatically.
+  - `markdown`: a committed `BACKLOG.md`. Tasks are refs like `E1` and `T3`, ticked as they finish.
+  - `none`: only the coordinator's `plan.md`.
+- **`depth`:** how far a run goes.
+  - `plan`: plan, then stop for your approval. Resume with `orcaducho start` or by typing into the coordinator's terminal.
+  - `objective`: one objective, one PR.
+  - `epic-approval`: pause after each epic.
+  - `drain`: after each PR, start the next backlog item, up to `maxItems`. The chain stops at the first failed task or failed review.
+- **`ship`:** `pr-ready`, `pr-draft`, or `local` (commit only, no push). **`autoMerge`** turns on GitHub auto-merge (squash) for a ready PR once checks pass.
+- **Autonomy:** runs are unattended by default (see [Autonomy](#autonomy)). Every session starts in auto mode, where a classifier approves routine actions. `--skip-permissions` uses `--dangerously-skip-permissions` instead; use it only in a container or VM. `--supervised` (`"autonomous": false`) turns the autonomy hooks off.
+- **`isolate`:** on by default. Workers, leads and the reviewer start without your user skills, plugins, hooks and MCP servers (see [Token budget](#token-budget)). Turn it off with `--no-isolate` if your workers need something from your user settings, such as an `apiKeyHelper`.
+- **`advisor`:** an advisor model (e.g. `opus`) passed as `--advisor` to leads and workers, so a Haiku worker can consult Opus at decision points instead of failing and being retried. Experimental, Anthropic API only.
+- **`lang`:** `en` or `es`, the language of issue headings and comments.
 
-`.orcaducho/` holds the coordinator's resumable plan. `orcaducho init` already keeps it out of git; if you skipped `init`, add it to `.gitignore`.
+`.orcaducho/` holds the coordinator's resumable plan. `orcaducho init` keeps it out of git; if you skipped `init`, add it to `.gitignore`.
 
 ## Usage
 
@@ -138,13 +174,14 @@ orcaducho start --name orcaducho/login-rate-limit "add rate limiting to the logi
 
 1. **In Orca:** a worktree and terminal named `orcaducho:coordinator · <objective>`. Shortly after, one terminal and child worktree per task, named `orcaducho:worker · <task>` or `orcaducho:lead · <epic>`.
 2. **On GitHub:** an epic issue, with one sub-issue per task tagged by risk. Each task issue is written for humans (what to do, where, files it may change, a checklist of acceptance criteria), with the agent's compact spec kept verbatim in a collapsed block. Each worker's 3-sentence result is posted as a comment on its issue.
-3. **At the end:** one review of the whole run branch, then one PR from the run branch to `base` that closes the epic and the task issues, plus a short per-task report from the coordinator.
+3. **At the end:** one review of the whole run branch, then delivery as your `ship` policy says (by default one PR from the run branch to `base` that closes the epic and the task issues), plus a short per-task report from the coordinator. With `todo: markdown` the plan lives in `BACKLOG.md` instead of GitHub issues.
 
 ### Steering, questions and resuming
 
 - **Questions:** nobody is asked. Workers ask the coordinator through Orca; the coordinator decides product questions itself, records them on the epic as "to confirm" and lists them in the PR.
 - **Talking to the coordinator:** type into its terminal at any time.
-- **Resuming:** if the coordinator's session ends, run `orcaducho start` again in the run worktree's Orca terminal. It resumes from `.orcaducho/plan.md` and Orca's task state without planning again.
+- **Resuming:** if the coordinator's session ends, run `orcaducho start` again in the run worktree's Orca terminal. It resumes from `.orcaducho/plan.md` and Orca's task state without planning again. With `depth: plan` or `epic-approval`, resuming (or typing "continue" into its terminal) is the approval.
+- **Cost:** `orcaducho cost` prints the tokens each role and model used.
 
 ## How it works
 
@@ -162,6 +199,10 @@ orcaducho start --name orcaducho/login-rate-limit "add rate limiting to the logi
 
 - **Mechanics live in a script.** Worktree and terminal creation, merges, GitHub labels and comments run in `bin/orcaducho`, so no model tokens are spent on them.
 - **Short agent prompts,** because every worker pays for its prompt.
+- **Isolated sessions.** Every call re-sends the session's base context, so its size multiplies across every call of every agent. Workers, leads and the reviewer start with `--strict-mcp-config --disable-slash-commands --setting-sources project,local` and load orcaducho with `--plugin-dir`. They keep the project's own `.mcp.json`, skills and settings. Measured on a bare call: about 25k tokens down to 10k, and a whole Haiku diff review costs about 3.7k.
+- **The coordinator restarts each wave.** After it starts a wave it writes `Checkpoint: wave` to `plan.md` and ends its turn. The `stop` hook then types `/clear` and a resume prompt into its own Orca terminal, so later waves do not pay for the history of earlier ones. It is the same terminal, and you can still type into it.
+- **Specs name the code.** Explore reports file paths and symbols, and every `Target:` is written as `path::symbol`; `orcaducho issue` warns when it is not. Named targets get right answers far more often than vague ones.
+- **Measure it.** `orcaducho cost` sums real token usage per role and model from the session transcripts (subagents included).
 
 ### Named agents in Orca
 
@@ -193,7 +234,8 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 - **`guard`:** the coordinator may write only `.orcaducho/` and `.orcaducho.json`; a worker may write only its `--owns` globs.
 - **`gate`:** the risk-tiered gate described above. After two failures, it tells the worker to report `failed` so the coordinator escalates.
 - **`post`:** mirrors each `worker_done` onto the task's GitHub issue as a readable comment.
-- **`ask`, `permission`, `stop`:** the autonomy layers above; off with `"autonomous": false`.
+- **`ask`, `permission`, `stop`:** the autonomy layers above; off with `"autonomous": false`. `stop` also runs the wave restart.
+- **`session`:** records each orcaducho session and its transcript in `.git/orcaducho/sessions.jsonl` for `orcaducho cost`.
 
 ### State
 
@@ -205,14 +247,21 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 
 | Command | What it does |
 |---|---|
-| `orcaducho start [--name <branch>] [--base <ref>] [--model opus] [--effort <lvl>] "<objective>"` | Launch the coordinator (new worktree with `--name`, else in this terminal) |
+| `orcaducho start [--name <branch>] [--base <ref>] [--model opus] [--effort <lvl>] [--item <ref>] "<objective>"` | Launch the coordinator (new worktree with `--name`, else in this terminal) |
 | `orcaducho spawn --role worker\|lead --task <id> --title "<t>" [--risk low\|med\|high] [--issue <n>] [--owns "<globs>"] [--model <m>] [--effort <lvl>] [--worktree new-child\|current\|<selector>] [--retry-of <dispatch>] [--run <run>]` | Start a named, supervised agent for an Orca Task (prints JSON with `dispatch`, `handle`, `worktree`, `branch`) |
 | `orcaducho release --dispatch <id>` | `worker-release`, then close the agent's terminal |
 | `orcaducho merge <branch>` | `git merge --no-ff`. Exits 2 and lists the conflicting files if it conflicts (the merge is aborted) |
 | `orcaducho review [--base <ref>] [--model sonnet]` | One headless review of the whole run branch against its base; exits 3 on FAIL |
 | `orcaducho issue epic\|task --title "<t>" [--body "<b>"] [--goal "<g>"] [--parent <n>] [--risk <r>]` | Create an issue or sub-issue; prints its number, or `-` if issues are off. A task `--body` with `Target:`/`Change:`/`Constraints:`/`Ownership:`/`Acceptance:` labels is rendered for humans; an epic `--goal` is shown and `--body` collapsed |
 | `orcaducho refresh <n>...` | Re-render task issues created as raw specs by orcaducho < 0.4 |
-| `orcaducho init [--check "<cmd>"] [--base <ref>] [--lang en\|es] [--advisor <model>] [--skip-permissions] [--supervised] [--no-issues] [--force]` | Write `.orcaducho.json` for this repo and exclude `.orcaducho/` locally |
+| `orcaducho init` | In a terminal: the interactive setup agent (policy, CLAUDE.md, skills, rules, settings; lands on `orcaducho/setup`) |
+| `orcaducho init [--yes] [--check "<cmd>"] [--base <ref>] [--todo issues\|markdown\|none] [--depth plan\|objective\|epic-approval\|drain] [--max-items <n>] [--ship pr-ready\|pr-draft\|local] [--auto-merge] [--lang en\|es] [--advisor <model>] [--skip-permissions] [--supervised] [--no-isolate] [--force]` | Write `.orcaducho.json` without the agent |
+| `orcaducho init --set key=value [--set …]` / `--detect` | Change single settings (validated) / print detected defaults and the project's Claude setup |
+| `orcaducho done <ref> [--failed]` | Mark a task finished: tick it in `BACKLOG.md`, or label a failed issue `status:failed` |
+| `orcaducho backlog next\|take <ref>\|add "<objective>"` | The queue `depth: drain` works through (issues labelled `backlog`, or `## Todo` in `BACKLOG.md`) |
+| `orcaducho ship --title "<t>" [--body "<b>"]` | Deliver the run branch as the policy says: push and open a ready or draft PR, enable auto-merge, or keep it local |
+| `orcaducho cost [--hours <n>] [--json]` | Token usage of this repo's orcaducho sessions, by role and model |
+| `orcaducho audit [--measure]` | Report what inflates every session's base context; `--measure` compares a bare call with and without your skills and MCP servers (two Haiku calls) |
 | `orcaducho update [--auto-only]` | Update the plugin and CLI now, and turn on background auto-update (`--auto-only`: only the latter) |
 | `orcaducho install [--dir <path>]` | Symlink the CLI onto your PATH |
 | `orcaducho hook guard\|gate\|post\|ask\|permission\|stop` | Hook entry points (used by `hooks/hooks.json`) |
@@ -225,9 +274,14 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 |---|---|---|
 | `check` | `""` (no checks) | Shell command that must pass before a worker reports success |
 | `base` | repo default branch | Base of the run worktree and target of the PR |
-| `issues` | `true` | Mirror the plan and results to GitHub issues |
+| `todo` | `issues` | `issues`, `markdown` (`BACKLOG.md`) or `none`. Configs from before 0.6 with `"issues": false` read as `none` |
+| `depth` | `objective` | `plan`, `objective`, `epic-approval` or `drain` |
+| `maxItems` | `3` | `drain`: backlog items per chain |
+| `ship` | `pr-ready` | `pr-ready`, `pr-draft` or `local` |
+| `autoMerge` | `false` | Enable GitHub auto-merge on a ready PR |
 | `lang` | `en` | Language of issue headings and comments (`en`, `es`) |
 | `autonomous` | `true` | Deny questions and permission prompts, and keep the coordinator looping until the run is done |
+| `isolate` | `true` | Start workers, leads and the reviewer without user skills, plugins, hooks and MCP servers |
 | `advisor` | `""` (off) | Advisor model for leads and workers (`--advisor`) |
 | `claudeArgs` | `["--permission-mode", "auto"]` | Extra arguments for every orcaducho `claude` session |
 
@@ -238,7 +292,7 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 | `ORCADUCHO_PLUGIN_DIR` | Load the plugin from this checkout (`--plugin-dir`) instead of the installed copy; inherited by child sessions |
 | `ORCADUCHO_NO_UPDATE` | Skip the daily update check in `orcaducho start` |
 | `ORCA_CLI_COMMAND` | Orca executable to use (otherwise `orca`, or `orca-ide` on Linux outside Orca terminals) |
-| `ORCADUCHO_ROLE`, `_TASK`, `_RISK`, `_ISSUE`, `_OWNS`, `_BASE`, `_MODEL`, `_READONLY` | Set by `orcaducho spawn` for each session; do not set by hand |
+| `ORCADUCHO_ROLE`, `_TASK`, `_RISK`, `_ISSUE`, `_OWNS`, `_BASE`, `_MODEL`, `_READONLY`, `_DRAIN`, `_ITEM` | Set by `orcaducho spawn` for each session; do not set by hand |
 
 ## Troubleshooting
 
@@ -247,6 +301,8 @@ The hooks are inert unless `ORCADUCHO_ROLE` is set, so your ordinary Claude Code
 - **Linux:** outside Orca terminals, bare `orca` is the GNOME screen reader. orcaducho uses `orca-ide` there automatically.
 - **`nested_worker_depth_exceeded`.** Orca's nesting limit was reached. The lead implements that task itself.
 - **An issue number prints `-`.** `gh` is missing or not logged in, Issues are disabled on the repo, or `"issues": false` is set.
+- **An isolated worker cannot authenticate or misses a tool.** Isolated sessions skip your user settings (for example an `apiKeyHelper`) and your MCP servers. Put what the project needs in its own `.claude/settings.json` or `.mcp.json`, or set `"isolate": false`.
+- **The coordinator does not restart after a wave.** The restart needs the coordinator's Orca terminal (`ORCA_TERMINAL_HANDLE`). Without it, the `stop` hook removes the checkpoint and the coordinator simply continues.
 - **Workers are blocked by the gate.** The `check` command fails on the base branch too. Fix the base first, or adjust `check`.
 
 ## Update and uninstall

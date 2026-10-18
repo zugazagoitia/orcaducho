@@ -159,9 +159,176 @@ class InitTest(unittest.TestCase):
         self.assertNotIn("--advisor", od.claude_argv("coordinator", "opus", None, "n", {}, {**od.config(), "advisor": "opus"}))
 
     def test_coordinator_prompt(self):
-        self.assertIsNone(od.coordinator_prompt("", {}))
+        self.assertTrue(od.coordinator_prompt("", {}).startswith(od.RESUME))
         self.assertIn("authorised", od.coordinator_prompt("do x", {"base": "develop"}))
-        self.assertEqual(od.coordinator_prompt("do x", {"autonomous": False}), "do x")
+        self.assertNotIn("authorised", od.coordinator_prompt("do x", {"autonomous": False}))
+
+    def test_prompt_follows_ship_and_depth_policy(self):
+        local = od.coordinator_prompt("do x", {"ship": "local", "todo": "markdown"})
+        self.assertIn("do not push", local)
+        self.assertNotIn("create the planned issues", local)
+        auto = od.coordinator_prompt("do x", {"ship": "pr-draft", "autoMerge": True, "todo": "issues"})
+        self.assertIn("draft PR", auto)
+        drain = od.coordinator_prompt("do x", {"depth": "drain", "maxItems": 2, "todo": "issues"}, drain=1)
+        self.assertIn("fewer than 2", drain)
+        self.assertIn("--drain 2", drain)
+
+    def test_workers_and_reviewer_start_lean(self):
+        cfg = od.config()
+        worker = od.claude_argv("worker", "haiku", None, "n", {}, cfg)
+        for flag in ("--strict-mcp-config", "--disable-slash-commands", "--setting-sources", "--plugin-dir"):
+            self.assertIn(flag, worker)
+        self.assertEqual(worker[worker.index("--setting-sources") + 1], "project,local")
+        self.assertNotIn("--strict-mcp-config", od.claude_argv("coordinator", "opus", None, "n", {}, cfg))
+        self.assertNotIn("--strict-mcp-config", od.claude_argv("worker", "haiku", None, "n", {}, {**cfg, "isolate": False}))
+
+    def test_parse_setting(self):
+        self.assertEqual(od.parse_setting("autoMerge=true"), ("autoMerge", True))
+        self.assertEqual(od.parse_setting("maxItems=5"), ("maxItems", 5))
+        self.assertEqual(od.parse_setting("claudeArgs=--a b"), ("claudeArgs", ["--a", "b"]))
+        for bad in ("depth=forever", "nope=1", "autoMerge=yes", "maxItems=x", "check"):
+            with self.assertRaises(SystemExit):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    od.parse_setting(bad)
+
+    def test_init_set_merges_and_validates(self):
+        with Repo() as repo, chdir(repo):
+            (repo / ".orcaducho.json").write_text(json.dumps({"check": "make test", "issues": False}))
+            capture(od.cmd_init, init_args(set=["depth=plan", "ship=local"]))
+            cfg = json.loads((repo / ".orcaducho.json").read_text())
+            self.assertEqual((cfg["check"], cfg["todo"], cfg["depth"], cfg["ship"]), ("make test", "none", "plan", "local"))
+            self.assertNotIn("issues", cfg)
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                od.cmd_init(init_args(set=["depth=drain"]))
+
+    def test_init_with_flags_is_not_interactive(self):
+        with Repo() as repo, chdir(repo), mock.patch.object(od.os, "execvp") as ex:
+            capture(od.cmd_init, init_args(todo="markdown", check="true"))
+            ex.assert_not_called()
+            self.assertEqual(json.loads((repo / ".orcaducho.json").read_text())["todo"], "markdown")
+
+
+def init_args(**kw):
+    a = dict(check=None, base=None, lang=None, advisor=None, todo=None, depth=None, max_items=None, ship=None,
+             no_issues=False, supervised=False, skip_permissions=False, auto_merge=False, no_isolate=False,
+             force=False, yes=False, set=None, detect=False)
+    a.update(kw)
+    return od.argparse.Namespace(**a)
+
+
+@contextlib.contextmanager
+def chdir(path):
+    old = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old)
+
+
+# A throwaway identity, and no commit signing from the developer's global git config.
+GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false"}
+
+
+def commit_all(repo):
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+
+
+class MarkdownStoreTest(unittest.TestCase):
+    def test_epic_task_and_done(self):
+        with Repo() as repo, chdir(repo), mock.patch.dict(os.environ, GIT_ENV):
+            os.environ.pop("ORCADUCHO_ROLE", None)
+            commit_all(repo)
+            (repo / ".orcaducho.json").write_text(json.dumps({"todo": "markdown"}))
+            issue = lambda **kw: od.argparse.Namespace(**{"title": "t", "body": "", "goal": None, "parent": None,
+                                                         "risk": "low", **kw})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                od.cmd_issue(issue(kind="epic", title="Rate limit", goal="Stop brute force."))
+                od.cmd_issue(issue(kind="task", title="Add limiter", parent="E1", risk="med",
+                                   body="Target: src/auth.ts::login\nChange: x"))
+                od.cmd_issue(issue(kind="task", title="Docs", parent="E1"))
+            self.assertEqual(out.getvalue().split(), ["E1", "T1", "T2"])
+            body = (repo / "BACKLOG.md").read_text()
+            self.assertIn("### E1 · Rate limit\n\nStop brute force.\n- [ ] T1 · Add limiter · risk med · src/auth.ts::login\n- [ ] T2", body)
+            capture(od.cmd_done, od.argparse.Namespace(ref="T1", failed=False))
+            capture(od.cmd_done, od.argparse.Namespace(ref="T2", failed=True))
+            body = (repo / "BACKLOG.md").read_text()
+            self.assertIn("- [x] T1 ·", body)
+            self.assertIn("- [!] T2 ·", body)
+            log = subprocess.run(["git", "log", "--oneline"], capture_output=True, text=True).stdout
+            self.assertIn("backlog: T2 failed", log)
+
+    def test_target_without_path_warns(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            od.warn_unnamed_target("Target: the login thing\nChange: x")
+        self.assertIn("path::symbol", err.getvalue())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            od.warn_unnamed_target("Target: src/auth/login.ts::login")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_backlog_next_take_add(self):
+        with Repo() as repo, chdir(repo):
+            (repo / ".orcaducho.json").write_text(json.dumps({"todo": "markdown"}))
+            (repo / "BACKLOG.md").write_text("# Backlog\n\n## Todo\n- [ ] first\n- [x] old\n\n## Runs\n- [ ] T1 · not a todo\n")
+            nxt = capture(od.cmd_backlog, od.argparse.Namespace(action="next", ref=None))
+            self.assertEqual(nxt["title"], "first")
+            capture(od.cmd_backlog, od.argparse.Namespace(action="add", ref="second"))
+            capture(od.cmd_backlog, od.argparse.Namespace(action="take", ref=nxt["ref"]))
+            self.assertEqual(capture(od.cmd_backlog, od.argparse.Namespace(action="next", ref=None))["title"], "second")
+            self.assertIn("- [ ] first\n- [x] old\n- [ ] second\n", (repo / "BACKLOG.md").read_text())
+
+    def test_ship_local_ticks_backlog_item(self):
+        with Repo() as repo, chdir(repo), mock.patch.dict(os.environ, GIT_ENV):
+            commit_all(repo)
+            (repo / ".orcaducho.json").write_text(json.dumps({"todo": "markdown", "ship": "local"}))
+            (repo / "BACKLOG.md").write_text("# Backlog\n\n## Todo\n- [ ] first\n")
+            ref = od.todo_items((repo / "BACKLOG.md").read_text())[0][0]
+            with mock.patch.dict(os.environ, {"ORCADUCHO_ITEM": ref}):
+                out = capture(od.cmd_ship, od.argparse.Namespace(title="t", body=""))
+            self.assertFalse(out["pushed"])
+            self.assertIn("- [x] first", (repo / "BACKLOG.md").read_text())
+
+
+class RotationAndCostTest(unittest.TestCase):
+    def test_wave_checkpoint_rotates_coordinator(self):
+        with Repo() as repo, mock.patch.dict(os.environ, {"ORCADUCHO_ROLE": "coordinator", "ORCA_TERMINAL_HANDLE": "term_1"}), \
+                mock.patch.object(od, "detach") as popen:
+            (repo / ".orcaducho").mkdir()
+            plan = repo / ".orcaducho" / "plan.md"
+            plan.write_text("Run: r1\nCheckpoint: wave\n")
+            self.assertIsNone(capture(od.hook_stop, {"cwd": str(repo)}))
+            self.assertEqual(plan.read_text(), "Run: r1\n")
+            self.assertIn("rotate", popen.call_args[0][0])
+            popen.reset_mock()
+            out = capture(od.hook_stop, {"cwd": str(repo)})  # no checkpoint: keep looping
+            popen.assert_not_called()
+            self.assertIn("Status: done", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_paused_and_awaiting_approval_end_the_loop(self):
+        with Repo() as repo:
+            (repo / ".orcaducho").mkdir()
+            for status in ("paused", "awaiting-approval"):
+                (repo / ".orcaducho" / "plan.md").write_text(f"Status: {status}\n")
+                self.assertTrue(od.run_finished(str(repo)))
+
+    def test_session_registry_and_cost(self):
+        with Repo() as repo, chdir(repo), mock.patch.dict(os.environ, {"ORCADUCHO_ROLE": "worker", "ORCADUCHO_MODEL": "haiku"}):
+            t = repo / "t.jsonl"
+            msg = lambda i, n: json.dumps({"type": "assistant", "message": {"id": i, "model": "claude-haiku",
+                                           "usage": {"input_tokens": n, "cache_read_input_tokens": 10 * n, "output_tokens": 1}}})
+            t.write_text("\n".join([msg("a", 1), msg("a", 1), msg("b", 2), "{bad"]) + "\n")
+            (repo / "t" / "subagents").mkdir(parents=True)
+            (repo / "t" / "subagents" / "s.jsonl").write_text(msg("c", 3) + "\n")
+            od.hook_session({"cwd": str(repo), "session_id": "s1", "transcript_path": str(t), "source": "startup"})
+            od.hook_session({"cwd": str(repo), "session_id": "s1", "transcript_path": str(t), "source": "resume"})
+            rows = capture(od.cmd_cost, od.argparse.Namespace(hours=None, json=True))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]["role"], rows[0]["sessions"], rows[0]["input_tokens"]), ("worker", 1, 6))
+            self.assertEqual(rows[0]["total"], 6 + 60 + 3)
 
 
 class UpdateTest(unittest.TestCase):

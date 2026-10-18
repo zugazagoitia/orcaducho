@@ -66,6 +66,17 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/orcaducho\" hook session",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }
